@@ -521,6 +521,38 @@ export const handler = async (event) => {
                      `anon-${Date.now()}`;
       userId = `web:${baseId}`;
       history = parsed.userId ? await loadHistory(userId) : [];
+      
+      // Handle media from WhatsAppAdapter.mjs
+      if (parsed.mediaInfo?.medias && inputText === '[AUDIO_MESSAGE_TO_TRANSCRIBE]') {
+        console.log('[WHATSAPP_ADAPTER] Processing audio message from WhatsAppAdapter');
+        try {
+          for (const media of parsed.mediaInfo.medias) {
+            if (media.url && media.contentType?.includes('audio')) {
+              console.log(`[AUDIO] Processing audio from WhatsAppAdapter: ${media.url}`);
+              
+              // Download and save the audio file to S3
+              const audioBuffer = await downloadTwilioMedia(media.url);
+              const audioExtension = media.contentType.split('/')[1] || 'ogg';
+              const audioFile = await putMedia(audioBuffer, media.contentType, userId, audioExtension);
+              imagenesS3.push(audioFile);
+              
+              // Transcribe the audio
+              const transcribedText = await transcribeAudio(audioFile.url, audioExtension);
+              if (transcribedText && transcribedText.trim()) {
+                inputText = transcribedText.trim();
+                console.log(`[AUDIO] Texto transcrito desde WhatsAppAdapter: "${inputText}"`);
+              } else {
+                inputText = "He recibido tu mensaje de audio pero no pude entender lo que dijiste. ¿Podrías escribirme o enviar el audio de nuevo?";
+                console.log('[AUDIO] No se pudo transcribir el audio desde WhatsAppAdapter');
+              }
+              break; // Process only the first audio file
+            }
+          }
+        } catch (e) {
+          console.error('[AUDIO] Error processing audio from WhatsAppAdapter:', e);
+          inputText = "He recibido tu mensaje de audio pero hubo un error al procesarlo. ¿Podrías escribirme o intentar de nuevo?";
+        }
+      }
     }
 
     // Handle empty messages more intelligently

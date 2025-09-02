@@ -191,10 +191,43 @@ export const handler = async (event) => {
 
   console.log('Form parseado OK:', form, 'MessageId:', messageId);
 
-  // Extract message text from different formats
+  // Extract message text and media from different formats
   let mensajeUsuario = 'mensaje vacío';
+  let mediaInfo = null;
   
-  if (form?.Body?.trim?.()) {
+  // Check for media first (Twilio format)
+  const numMedia = parseInt(form?.NumMedia || '0');
+  const messageType = form?.MessageType;
+  
+  if (numMedia > 0 || messageType === 'audio') {
+    console.log('Detected media message - NumMedia:', numMedia, 'MessageType:', messageType);
+    
+    // Extract media information
+    const medias = [];
+    for (let i = 0; i < Math.max(numMedia, 1); i++) {
+      const mediaUrl = form[`MediaUrl${i}`];
+      const mediaContentType = form[`MediaContentType${i}`];
+      if (mediaUrl) {
+        medias.push({
+          url: mediaUrl,
+          contentType: mediaContentType
+        });
+        console.log(`Media ${i} found:`, { url: mediaUrl, contentType: mediaContentType });
+      }
+    }
+    
+    if (medias.length > 0) {
+      mediaInfo = { medias };
+      // For audio messages, set a placeholder text that will be replaced by transcription
+      if (messageType === 'audio' || medias.some(m => m.contentType?.includes('audio'))) {
+        mensajeUsuario = '[AUDIO_MESSAGE_TO_TRANSCRIBE]';
+        console.log('Audio message detected, will be sent for transcription');
+      }
+    }
+  }
+  
+  // Extract text message if no audio or if Body has content
+  if (form?.Body?.trim?.() && mensajeUsuario === 'mensaje vacío') {
     // Twilio format
     mensajeUsuario = form.Body.trim();
     console.log('Message extracted from Twilio Body field:', mensajeUsuario);
@@ -202,7 +235,7 @@ export const handler = async (event) => {
     // Meta WhatsApp webhook format
     mensajeUsuario = form.entry[0].changes[0].value.messages[0].text.body.trim();
     console.log('Message extracted from Meta webhook format:', mensajeUsuario);
-  } else {
+  } else if (mensajeUsuario === 'mensaje vacío') {
     // Try to find any field that might contain the message
     console.log('Standard extraction failed, trying fallback methods...');
     console.log('Form keys available:', Object.keys(form));
@@ -452,7 +485,9 @@ export const handler = async (event) => {
     // Pass phone info to maintain consistency
     phone,
     userId,
-    phoneNumberId
+    phoneNumberId,
+    // Pass media information for audio processing
+    ...(mediaInfo && { mediaInfo })
   };
 
   try {
