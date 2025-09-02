@@ -44,15 +44,61 @@ const parseBody = (event) => {
     if (event.headers['content-type']?.includes('application/json')) {
       return JSON.parse(event.body);
     } else {
-      return querystring.parse(event.body);
+      // Try normal parsing first
+      let parsed = querystring.parse(event.body);
+      
+      // If parsing resulted in a single key with no value, it might be malformed data
+      if (Object.keys(parsed).length === 1 && Object.values(parsed)[0] === '') {
+        const singleKey = Object.keys(parsed)[0];
+        
+        // Try to decode as Base64 if it looks like it
+        if (/^[A-Za-z0-9+/]+=*$/.test(singleKey) && singleKey.length > 100) {
+          try {
+            const decodedBody = Buffer.from(singleKey, 'base64').toString('utf8');
+            console.log('Successfully decoded Base64 body');
+            parsed = querystring.parse(decodedBody);
+          } catch (base64Error) {
+            console.log('Base64 decode failed:', base64Error.message);
+          }
+        }
+      }
+      
+      return parsed;
     }
   } catch (error) {
     console.error('Parse error:', error);
+    
+    // Try emergency parsing from raw body as last resort
+    if (event.body) {
+      console.log('Attempting emergency parsing from raw body...');
+      try {
+        const bodyMatch = event.body.match(/Body=([^&]+)/);
+        const fromMatch = event.body.match(/From=([^&]+)/);
+        const waidMatch = event.body.match(/WaId=([^&]+)/);
+        
+        if (bodyMatch || fromMatch || waidMatch) {
+          const form = {};
+          if (bodyMatch) {
+            form.Body = decodeURIComponent(bodyMatch[1].replace(/\+/g, ' '));
+          }
+          if (fromMatch) {
+            form.From = decodeURIComponent(fromMatch[1]);
+          }
+          if (waidMatch) {
+            form.WaId = decodeURIComponent(waidMatch[1]);
+          }
+          return form;
+        }
+      } catch (emergencyError) {
+        console.error('Emergency parsing failed:', emergencyError.message);
+      }
+    }
+    
     return {};
   }
 };
 
-const extractPhone = (form) => {
+const extractPhone = (form, event) => {
   // Twilio format
   if (form.From) {
     return form.From.replace(/^whatsapp:/, "");
@@ -60,10 +106,52 @@ const extractPhone = (form) => {
   if (form.WaId) {
     return form.WaId;
   }
+  
   // Meta format
   if (form?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.from) {
     return form.entry[0].changes[0].value.messages[0].from;
   }
+  
+  // Meta contacts format
+  if (form?.entry?.[0]?.changes?.[0]?.value?.contacts?.[0]?.wa_id) {
+    return form.entry[0].changes[0].value.contacts[0].wa_id;
+  }
+  
+  // Fallback: try to extract from malformed form data
+  if (Object.keys(form).length === 1) {
+    const singleKey = Object.keys(form)[0];
+    
+    // Try to extract from URL-encoded data in the key itself
+    const fromMatch = singleKey.match(/From=whatsapp%3A%2B(\d+)/);
+    const waidMatch = singleKey.match(/WaId=(\d+)/);
+    
+    if (fromMatch) {
+      return `+${fromMatch[1]}`;
+    }
+    if (waidMatch) {
+      return `+${waidMatch[1]}`;
+    }
+  }
+  
+  // Last resort: try regex patterns on raw event body if available
+  if (event?.body) {
+    const phonePatterns = [
+      /From=whatsapp%3A%2B(\d+)/,
+      /From=whatsapp:(\+\d+)/,
+      /WaId=(\d+)/,
+      /"from":"(\d+)"/,
+      /"wa_id":"(\d+)"/
+    ];
+    
+    for (const pattern of phonePatterns) {
+      const match = event.body.match(pattern);
+      if (match) {
+        const phone = match[1].replace(/^\+/, '');
+        return `+${phone}`;
+      }
+    }
+  }
+  
   return null;
 };
 
@@ -309,17 +397,41 @@ const addToHistory = (userId, message) => {
 export const handler = async (event) => {
   console.log('Processing message...');
   
+  // Handle webhook verification for Meta WhatsApp
+  if (event.httpMethod === 'GET' && event.queryStringParameters) {
+    const mode = event.queryStringParameters['hub.mode'];
+    const token = event.queryStringParameters['hub.verify_token'];
+    const challenge = event.queryStringParameters['hub.challenge'];
+    
+    if (mode === 'subscribe' && token === process.env.WEBHOOK_VERIFY_TOKEN) {
+      console.log('Webhook verified');
+      return {
+        statusCode: 200,
+        body: challenge
+      };
+    } else {
+      console.log('Webhook verification failed');
+      return {
+        statusCode: 403,
+        body: 'Forbidden'
+      };
+    }
+  }
+  
   try {
     // 1. Parse form
     const form = parseBody(event);
     
     // 2. Extract basic info
-    const phone = extractPhone(form);
+    const phone = extractPhone(form, event);
     const userId = phone ? `wa:${normalizePhone(phone)}` : 'anon';
     const useTwilio = isTwilioMessage(form);
     
     if (!phone) {
       console.error('No phone found');
+      console.error('Form keys:', Object.keys(form));
+      console.error('Form values:', Object.values(form));
+      console.error('Event body preview:', event.body?.substring(0, 200));
       return { statusCode: 400, body: 'No phone number' };
     }
     
@@ -395,7 +507,7 @@ export const handler = async (event) => {
     
     // Try to send error message to user
     const form = parseBody(event);
-    const phone = extractPhone(form);
+    const phone = extractPhone(form, event);
     
     if (phone) {
       const useTwilio = isTwilioMessage(form);
