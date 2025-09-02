@@ -23,25 +23,34 @@ const bedrock = new BedrockRuntimeClient({ region: REGION });
 
 const SYSTEM_TEXT = `Actuás como un asistente virtual joven, experto en ayudar a inquilinos con problemas en casa.
 Respondés en estilo conversacional argentino, breve y directo, como en un chat real.
-Usá modismos suaves y abreviaciones comunes (tipo “x”, “tmb”, “info”, “urgente”, etc).
+Usá modismos suaves y abreviaciones comunes (tipo "x", "tmb", "info", "urgente", etc).
+
+IMPORTANTE: Revisá siempre el historial de la conversación para no repetir preguntas ya hechas o información ya dada.
+
 Reglas clave:
 - Respondé con calidez y cercanía, como si charlaras por WhatsApp.
-- Usá oraciones cortas, divididas en mensajes como en una conversación real.
+- Usá oraciones cortas, divididas en párrafos naturales.
 - No mandes listas, bullets ni bloques largos.
 - Hacé solo una pregunta a la vez.
 - Nunca le digas al cliente que se arregle solo. Nosotros nos encargamos.
 - Pedí una foto del problema, siempre.
-Secuencia obligatoria:
-1. Arrancá con saludo buena onda + frase motivadora.
-2. Pedí nombre completo.
-3. Preguntá si es el inquilino o alguien más.
+- Si el usuario ya te saludó, no vuelvas a presentarte.
+- Si ya tenés algún dato (nombre, dirección, etc.), no lo vuelvas a pedir.
+
+Secuencia de información a recopilar (solo preguntá lo que falta):
+1. Si es el primer mensaje: saludo buena onda + frase motivadora + presentación.
+2. Nombre completo (si no lo tenés).
+3. Si es el inquilino o alguien más.
 4. Dirección exacta.
 5. ¿Qué pasó? (detalle del problema).
 6. Deducí si necesita plomero/gasista/electricista.
 7. Explicá que Toori gestiona presupuestos.
 8. Preguntá si es urgente.
 9. Sugerí medida preventiva (si aplica).
-⚠️ Al final, prepará este bloque JSON (no mostrar al cliente):
+
+Si el usuario manda mensajes vacíos o confusos repetidamente, ayudalo a expresar su problema.
+
+⚠️ Solo cuando tengas TODA la información, prepará este bloque JSON (no mostrar al cliente):
 [RESUMEN_JSON]
 {
   "nombre": "Nombre completo",
@@ -59,8 +68,37 @@ const streamToString = async (stream) => {
   return Buffer.concat(chunks).toString("utf-8");
 };
 
-const dividirRespuesta = (texto) =>
-  texto.split(/\n+|(?<=\.)\s+/).map(p => p.trim()).filter(p => p.length > 0);
+const dividirRespuesta = (texto) => {
+  // First, split by double newlines (paragraph breaks)
+  const paragraphs = texto.split(/\n\n+/);
+  const messages = [];
+  
+  for (const paragraph of paragraphs) {
+    const trimmed = paragraph.trim();
+    if (!trimmed) continue;
+    
+    // If paragraph is short enough, send as one message
+    if (trimmed.length <= 300) {
+      messages.push(trimmed);
+    } else {
+      // Split longer paragraphs by sentences, but keep them reasonable length
+      const sentences = trimmed.split(/(?<=\.)\s+/);
+      let currentMessage = "";
+      
+      for (const sentence of sentences) {
+        if (currentMessage.length + sentence.length <= 300) {
+          currentMessage += (currentMessage ? " " : "") + sentence;
+        } else {
+          if (currentMessage) messages.push(currentMessage);
+          currentMessage = sentence;
+        }
+      }
+      if (currentMessage) messages.push(currentMessage);
+    }
+  }
+  
+  return messages.length > 0 ? messages : [texto.trim()];
+};
 
 const esperar = (ms) => new Promise(res => setTimeout(res, ms));
 
@@ -159,6 +197,7 @@ export const handler = async (event) => {
   let userId = null;
   let history = [];
   let imagenesS3 = [];
+  let messageId = null;
 
   try {
     const rawBody = typeof event.body === "string"
@@ -172,6 +211,8 @@ export const handler = async (event) => {
       try {
         const parsed = JSON.parse(rawBody);
         metaMsg = parsed?.entry?.[0]?.changes?.[0]?.value?.messages?.[0] || null;
+        // Get message ID to prevent duplicate processing
+        messageId = metaMsg?.id || null;
       } catch {}
     }
 
@@ -206,8 +247,26 @@ export const handler = async (event) => {
       phone = metaMsg.from;
       userId = `wa:${normalizePhone(phone)}`;
       inputText = metaMsg?.text?.body?.trim() || "";
-      try { imagenesS3 = await saveWhatsAppMediaIfAny(metaMsg, userId); } catch (e) { console.warn("Meta media:", e?.message); }
+      
+      // Load history first to check for duplicate messages
       history = await loadHistory(userId);
+      
+      // Check if this message was already processed (prevent duplicates)
+      if (messageId) {
+        const recentMessages = history.slice(-10); // Check last 10 messages
+        const isDuplicate = recentMessages.some(msg => 
+          msg.role === "user" && 
+          msg.content?.[0]?.text === inputText &&
+          msg.messageId === messageId
+        );
+        
+        if (isDuplicate) {
+          console.log(`[DEBUG] Mensaje duplicado detectado: ${messageId}`);
+          return { statusCode: 200, body: JSON.stringify({ status: "DUPLICATE_IGNORED" }) };
+        }
+      }
+      
+      try { imagenesS3 = await saveWhatsAppMediaIfAny(metaMsg, userId); } catch (e) { console.warn("Meta media:", e?.message); }
     } else if (twilioData) {
       isWhatsApp = true;
       isTwilio = true;
@@ -237,18 +296,38 @@ export const handler = async (event) => {
       history = parsed.userId ? await loadHistory(userId) : [];
     }
 
+    // Handle empty messages more intelligently
     if (!inputText && imagenesS3.length === 0) {
-      inputText = "mensaje vacío";
-      console.log(`[DEBUG] Mensaje vacío detectado para userId: ${userId}`);
+      // Check if this is a repeated empty message
+      const recentMessages = history.slice(-4); // Check last 4 messages
+      const recentEmptyMessages = recentMessages.filter(m => 
+        m.role === "user" && m.content?.[0]?.text === "mensaje vacío"
+      );
+      
+      if (recentEmptyMessages.length >= 2) {
+        // User sent multiple empty messages, ask for clarification
+        inputText = "necesito ayuda pero no sé cómo explicar mi problema";
+      } else {
+        inputText = "mensaje vacío";
+      }
+      console.log(`[DEBUG] Mensaje vacío detectado para userId: ${userId}, recientes: ${recentEmptyMessages.length}`);
     }
 
     console.log(`[DEBUG] InputText: "${inputText}", UserId: ${userId}, HistoryLength: ${history.length}`);
 
     const baseHistory = Array.isArray(history) ? history : [];
     const safeHistory = trimHistory(baseHistory);
+    
+    // Create user message with messageId if available
+    const userMessage = inputText ? {
+      role: "user", 
+      content: [{ type: "text", text: inputText }],
+      ...(messageId && { messageId })
+    } : null;
+    
     const updatedMessages = [
       ...safeHistory,
-      ...(inputText ? [{ role: "user", content: [{ type: "text", text: inputText }] }] : [])
+      ...(userMessage ? [userMessage] : [])
     ];
 
     const command = new InvokeModelCommand({
@@ -318,7 +397,7 @@ export const handler = async (event) => {
             body: form
           });
           if (!resp.ok) console.error("Twilio send fail:", resp.status, await resp.text());
-          await esperar(650);
+          await esperar(800);
         }
       } else {
         for (const fragmento of mensajes) {
@@ -327,7 +406,7 @@ export const handler = async (event) => {
             headers: { "Authorization": `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" },
             body: JSON.stringify({ messaging_product: "whatsapp", to: phone, type: "text", text: { body: fragmento } })
           });
-          await esperar(650);
+          await esperar(800);
         }
       }
       return { statusCode: 200, body: JSON.stringify({ status: "OK" }) };
