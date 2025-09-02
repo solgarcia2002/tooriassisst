@@ -33,11 +33,8 @@ const isAudio = (contentType) => {
 
 const getTwilioAuth = () => {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
-    console.error('[AUTH] Missing Twilio credentials:', {
-      accountSid: TWILIO_ACCOUNT_SID ? 'present' : 'missing',
-      authToken: TWILIO_AUTH_TOKEN ? 'present' : 'missing'
-    });
-    throw new Error('Missing Twilio credentials');
+    console.log('[AUTH] Twilio credentials not configured - using WhatsApp API instead');
+    return null; // Return null instead of throwing error
   }
   return "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
 };
@@ -186,7 +183,9 @@ const extractMediaUrl = (form) => {
 };
 
 const isTwilioMessage = (form) => {
-  return !!(form.From || form.WaId || form.MessageSid);
+  // Force WhatsApp API usage instead of Twilio to avoid credential issues
+  return false;
+  // Original logic: return !!(form.From || form.WaId || form.MessageSid);
 };
 
 // ==========================================
@@ -331,21 +330,9 @@ const sendWhatsAppMessage = async (phone, message) => {
 };
 
 const sendTwilioMessage = async (phone, message) => {
-  const form = new URLSearchParams();
-  form.set("To", `whatsapp:${phone}`);
-  form.set("From", TWILIO_WHATSAPP_FROM);
-  form.set("Body", message);
-
-  const response = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`, {
-    method: "POST",
-    headers: { 
-      Authorization: getTwilioAuth(), 
-      "Content-Type": "application/x-www-form-urlencoded" 
-    },
-    body: form
-  });
-  
-  return response.ok;
+  console.log('[TWILIO] sendTwilioMessage called but should not be used - falling back to WhatsApp API');
+  // Fallback to WhatsApp API instead of using Twilio
+  return await sendWhatsAppMessage(phone, message);
 };
 
 const sendMessage = async (phone, message, useTwilio) => {
