@@ -224,9 +224,17 @@ export const handler = async (event) => {
       // Web/API genérico
       const parsed = rawBody ? JSON.parse(rawBody) : {};
       inputText = typeof parsed.input === "string" ? parsed.input : parsed.input?.text;
-      const baseId = parsed.userId || parsed?.requestContext?.identity?.sourceIp || parsed?.requestContext?.requestId || "anon";
+      
+      // Para web, generar siempre una nueva sesión a menos que se proporcione explícitamente un userId
+      // Esto asegura que cada recarga de página inicie una conversación fresca
+      const baseId = parsed.userId || 
+                     parsed?.requestContext?.requestId || 
+                     crypto.randomUUID() || 
+                     `anon-${Date.now()}`;
       userId = `web:${baseId}`;
-      history = await loadHistory(userId);
+      
+      // Solo cargar historial si se proporcionó un userId explícito (para mantener sesión existente)
+      history = parsed.userId ? await loadHistory(userId) : [];
     }
 
     // si no hay texto ni media -> registrar como mensaje vacío pero continuar conversación
