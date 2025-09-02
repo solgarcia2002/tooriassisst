@@ -88,7 +88,9 @@ export const handler = async (event) => {
       console.log('First key sample:', allKeys[0]?.substring(0, 100));
       
       // If we have only one key and it looks like Base64 encoded data
-      if (allKeys.length === 1 && allKeys[0].length > 100 && !parsed[allKeys[0]]) {
+      // Check for single key that's long and either has no value or just '='
+      if (allKeys.length === 1 && allKeys[0].length > 100 && 
+          (!parsed[allKeys[0]] || parsed[allKeys[0]] === '' || parsed[allKeys[0]] === '=')) {
         const singleKey = allKeys[0];
         console.log('Detected potential Base64 encoded form data');
         
@@ -116,11 +118,27 @@ export const handler = async (event) => {
         }
       }
       
-      // If still having issues with nested encoding
-      if (allKeys.length === 1 && Object.values(parsed)[0] === '' && allKeys[0].includes('=')) {
+      // If still having issues with nested encoding or Base64 wasn't detected properly
+      if (allKeys.length === 1 && 
+          (Object.values(parsed)[0] === '' || Object.values(parsed)[0] === '=') && 
+          allKeys[0].includes('=')) {
         console.log('Detected nested form encoding, attempting to parse the key itself');
         const onlyKey = allKeys[0];
-        form = querystring.parse(decodeURIComponent(onlyKey));
+        try {
+          // First try to decode as Base64 if it looks like it
+          if (/^[A-Za-z0-9+/]+=*$/.test(onlyKey) && onlyKey.length > 100) {
+            console.log('Attempting Base64 decode in fallback');
+            const decodedBody = Buffer.from(onlyKey, 'base64').toString('utf8');
+            form = querystring.parse(decodedBody);
+            console.log('Fallback Base64 decode successful, keys:', Object.keys(form).length);
+          } else {
+            // Try URL decoding
+            form = querystring.parse(decodeURIComponent(onlyKey));
+          }
+        } catch (fallbackError) {
+          console.log('Fallback parsing failed:', fallbackError.message);
+          form = parsed;
+        }
       } else {
         form = parsed;
       }
@@ -213,6 +231,53 @@ export const handler = async (event) => {
         phoneNumberId,
         metadataPhoneId: value.metadata?.phone_number_id
       });
+    }
+  }
+  
+  // Fallback phone extraction if main parsing failed
+  if (userId === 'anon' && event.body) {
+    console.log('Main phone extraction failed, trying fallback methods...');
+    
+    // Try to extract phone from raw body using regex
+    const phonePatterns = [
+      /From=whatsapp%3A%2B(\d+)/,
+      /From=whatsapp:(\+\d+)/,
+      /WaId=(\d+)/,
+      /"from":"(\d+)"/,
+      /"wa_id":"(\d+)"/
+    ];
+    
+    for (const pattern of phonePatterns) {
+      const match = event.body.match(pattern);
+      if (match) {
+        const extractedPhone = match[1].replace(/^\+/, '');
+        const normalizedPhone = normalizePhone(extractedPhone);
+        userId = `wa:${normalizedPhone}`;
+        phone = extractedPhone;
+        console.log('Fallback phone extraction successful:', { extractedPhone, normalizedPhone, userId });
+        break;
+      }
+    }
+    
+    // If still anonymous, try to find existing conversations with recent activity
+    if (userId === 'anon') {
+      console.log('Phone extraction failed completely, checking for recent conversations...');
+      const recentUsers = Object.keys(memory)
+        .filter(key => key.startsWith('wa:') && memory[key] && memory[key].length > 0)
+        .sort((a, b) => {
+          const aLastMsg = memory[a][memory[a].length - 1];
+          const bLastMsg = memory[b][memory[b].length - 1];
+          const aTime = aLastMsg?.metadata?.timestamp || 0;
+          const bTime = bLastMsg?.metadata?.timestamp || 0;
+          return new Date(bTime) - new Date(aTime);
+        });
+      
+      if (recentUsers.length > 0) {
+        console.log('Found recent conversations, using most recent:', recentUsers[0]);
+        userId = recentUsers[0];
+        // Extract phone from userId for consistency
+        phone = userId.replace('wa:', '');
+      }
     }
   }
   
