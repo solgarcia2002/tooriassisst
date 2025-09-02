@@ -1,5 +1,8 @@
 import querystring from 'querystring';
 
+// Normalize phone number to match index.mjs format
+const normalizePhone = (s) => (s || "").replace(/\D/g, "");
+
 const memory = {}; // Historial temporal por usuario
 
 export const handler = async (event) => {
@@ -34,7 +37,19 @@ export const handler = async (event) => {
   console.log('Form parseado OK:', form, 'MessageId:', messageId);
 
   const mensajeUsuario = form?.Body?.trim?.() || 'mensaje vacío';
-  const userId = form?.From || 'anon'; // ej: whatsapp:+549351...
+  
+  // Extract and normalize phone number to match index.mjs format
+  let phone = null;
+  let userId = 'anon';
+  
+  if (form?.From) {
+    // Handle both WhatsApp Meta format and Twilio format
+    phone = form.From.replace(/^whatsapp:/, ""); // Remove whatsapp: prefix if present
+    const waid = form?.WaId || phone;
+    userId = `wa:${normalizePhone(waid)}`;
+  }
+  
+  console.log('Phone:', phone, 'UserId:', userId);
 
   // Obtener historial previo o crear nuevo
   let history = memory[userId] || [];
