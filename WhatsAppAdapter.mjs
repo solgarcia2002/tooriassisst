@@ -3,7 +3,65 @@ import querystring from 'querystring';
 // Normalize phone number to match index.mjs format
 const normalizePhone = (s) => (s || "").replace(/\D/g, "");
 
+// Get PHONE_NUMBER_ID from environment for consistency
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+
 const memory = {}; // Historial temporal por usuario
+
+// Enhanced logging for debugging conversation threads
+const logConversationState = (userId, action, details = {}) => {
+  console.log(`[CONVERSATION_THREAD] ${action} - UserId: ${userId}`, details);
+};
+
+// Backup conversation state to prevent loss
+const backupConversation = (userId, history) => {
+  try {
+    // Create a more persistent backup key
+    const backupKey = `backup_${userId}_${Date.now()}`;
+    memory[backupKey] = {
+      userId,
+      history: JSON.parse(JSON.stringify(history)), // Deep copy
+      timestamp: new Date().toISOString(),
+      lastMessageId: history[history.length - 1]?.messageId
+    };
+    
+    // Keep only last 3 backups per user to prevent memory overflow
+    const userBackups = Object.keys(memory)
+      .filter(key => key.startsWith(`backup_${userId}_`))
+      .sort()
+      .reverse();
+      
+    userBackups.slice(3).forEach(oldBackup => {
+      delete memory[oldBackup];
+    });
+    
+    logConversationState(userId, 'CONVERSATION_BACKED_UP', { backupKey, historyLength: history.length });
+  } catch (error) {
+    console.error('Error backing up conversation:', error);
+  }
+};
+
+// Restore conversation from backup if main history is lost
+const restoreConversation = (userId) => {
+  try {
+    const userBackups = Object.keys(memory)
+      .filter(key => key.startsWith(`backup_${userId}_`))
+      .sort()
+      .reverse();
+      
+    if (userBackups.length > 0) {
+      const latestBackup = memory[userBackups[0]];
+      logConversationState(userId, 'CONVERSATION_RESTORED', { 
+        backupKey: userBackups[0], 
+        historyLength: latestBackup.history.length 
+      });
+      return latestBackup.history;
+    }
+  } catch (error) {
+    console.error('Error restoring conversation:', error);
+  }
+  return [];
+};
 
 export const handler = async (event) => {
   console.log('Raw body:', event.body);
@@ -36,23 +94,90 @@ export const handler = async (event) => {
 
   console.log('Form parseado OK:', form, 'MessageId:', messageId);
 
-  const mensajeUsuario = form?.Body?.trim?.() || 'mensaje vacío';
+  // Extract message text from different formats
+  let mensajeUsuario = 'mensaje vacío';
+  
+  if (form?.Body?.trim?.()) {
+    // Twilio format
+    mensajeUsuario = form.Body.trim();
+  } else if (form?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.text?.body) {
+    // Meta WhatsApp webhook format
+    mensajeUsuario = form.entry[0].changes[0].value.messages[0].text.body.trim();
+  }
+  
+  console.log('Extracted message:', mensajeUsuario);
   
   // Extract and normalize phone number to match index.mjs format
   let phone = null;
   let userId = 'anon';
+  let phoneNumberId = PHONE_NUMBER_ID;
   
   if (form?.From) {
     // Handle both WhatsApp Meta format and Twilio format
     phone = form.From.replace(/^whatsapp:/, ""); // Remove whatsapp: prefix if present
     const waid = form?.WaId || phone;
-    userId = `wa:${normalizePhone(waid)}`;
+    
+    // More robust user ID creation to maintain consistency
+    const normalizedPhone = normalizePhone(waid);
+    userId = `wa:${normalizedPhone}`;
+    
+    // Log phone number extraction for debugging
+    logConversationState(userId, 'PHONE_EXTRACTED', { 
+      originalFrom: form.From, 
+      phone, 
+      waid, 
+      normalizedPhone,
+      phoneNumberId 
+    });
+  } else if (form?.entry?.[0]?.changes?.[0]?.value) {
+    // Handle Meta WhatsApp webhook format
+    const value = form.entry[0].changes[0].value;
+    const contact = value.contacts?.[0];
+    const message = value.messages?.[0];
+    
+    if (contact?.wa_id || message?.from) {
+      const waid = contact?.wa_id || message?.from;
+      phone = waid;
+      const normalizedPhone = normalizePhone(waid);
+      userId = `wa:${normalizedPhone}`;
+      
+      // Extract phone_number_id from webhook if available
+      phoneNumberId = value.metadata?.phone_number_id || PHONE_NUMBER_ID;
+      
+      logConversationState(userId, 'META_WEBHOOK_PHONE_EXTRACTED', { 
+        waid, 
+        phone, 
+        normalizedPhone,
+        phoneNumberId,
+        metadataPhoneId: value.metadata?.phone_number_id
+      });
+    }
   }
   
-  console.log('Phone:', phone, 'UserId:', userId);
+  console.log('Phone:', phone, 'UserId:', userId, 'PhoneNumberId:', phoneNumberId);
 
-  // Obtener historial previo o crear nuevo
-  let history = memory[userId] || [];
+  // Obtener historial previo o crear nuevo con fallback a backup
+  let history = memory[userId];
+  
+  if (!history || history.length === 0) {
+    // Try to restore from backup if main history is lost
+    history = restoreConversation(userId);
+    if (history.length > 0) {
+      memory[userId] = history; // Restore to main memory
+    }
+  }
+  
+  if (!history) {
+    history = [];
+  }
+  
+  // Log conversation state for debugging
+  logConversationState(userId, 'HISTORY_RETRIEVED', { 
+    historyLength: history.length,
+    messageId,
+    hasExistingConversation: history.length > 0,
+    phoneNumberId
+  });
 
   // Check for duplicate messages using messageId
   if (messageId) {
@@ -64,6 +189,7 @@ export const handler = async (event) => {
     );
     
     if (isDuplicate) {
+      logConversationState(userId, 'DUPLICATE_MESSAGE_DETECTED', { messageId, mensajeUsuario });
       console.log(`[DEBUG] Mensaje duplicado detectado: ${messageId}`);
       return {
         statusCode: 200,
@@ -73,18 +199,35 @@ export const handler = async (event) => {
     }
   }
 
-  // Agregar el nuevo mensaje del usuario con messageId
+  // Agregar el nuevo mensaje del usuario con messageId y phone info
   const userMessage = {
     role: "user",
     content: [{ type: "text", text: mensajeUsuario }],
-    ...(messageId && { messageId })
+    ...(messageId && { messageId }),
+    // Add metadata to help maintain conversation thread
+    metadata: {
+      phone,
+      userId,
+      phoneNumberId,
+      timestamp: new Date().toISOString()
+    }
   };
   
   history.push(userMessage);
+  
+  logConversationState(userId, 'USER_MESSAGE_ADDED', { 
+    messageId, 
+    messageLength: mensajeUsuario.length,
+    newHistoryLength: history.length
+  });
 
   const payload = {
     input: { type: "text", text: mensajeUsuario },
-    history
+    history,
+    // Pass phone info to maintain consistency
+    phone,
+    userId,
+    phoneNumberId
   };
 
   try {
@@ -114,14 +257,31 @@ export const handler = async (event) => {
       if (mensajes.length > 0) {
         mensaje = mensajes.join('\n\n');
 
-        // Agregar respuesta completa al historial
-        history.push({
+        // Agregar respuesta completa al historial con metadata
+        const assistantMessage = {
           role: "assistant",
-          content: response.reply
-        });
+          content: response.reply,
+          metadata: {
+            phone,
+            userId,
+            phoneNumberId,
+            timestamp: new Date().toISOString()
+          }
+        };
+        
+        history.push(assistantMessage);
 
         // Guardar historial actualizado
         memory[userId] = history;
+        
+        // Create backup of conversation to prevent loss
+        backupConversation(userId, history);
+        
+        logConversationState(userId, 'ASSISTANT_RESPONSE_ADDED', { 
+          responseLength: mensaje.length,
+          finalHistoryLength: history.length,
+          phoneNumberId
+        });
       }
     }
 
