@@ -233,39 +233,48 @@ export const handler = async (event) => {
         console.log("Raw body sample:", rawBody.substring(0, 200));
         
         // Parsear los parámetros del form
-        const params = new URLSearchParams(rawBody);
+        let params;
+        let allKeys;
         
-        // Debug: mostrar todas las claves encontradas
-        const allKeys = Array.from(params.keys());
+        // First try normal parsing
+        params = new URLSearchParams(rawBody);
+        allKeys = Array.from(params.keys());
         console.log("Claves encontradas:", allKeys);
         
-        // Si no hay claves válidas, intentar con el primer key como string completo
-        let from, waid, body, smsStatus, messageStatus, numMedia, messageSid;
-        
-        if (allKeys.length === 0 || (allKeys.length === 1 && allKeys[0].length > 100)) {
-          // El parsing falló, probablemente todo está en una sola clave
-          console.log("Parsing falló, intentando recuperar datos...");
-          const singleKey = allKeys[0] || '';
-          if (singleKey.includes('From=') || singleKey.includes('WaId=')) {
-            // Intentar parsear manualmente
-            const manualParams = new URLSearchParams(singleKey);
-            from = manualParams.get("From");
-            waid = manualParams.get("WaId");
-            body = manualParams.get("Body");
-            smsStatus = (manualParams.get("SmsStatus") || "").toLowerCase();
-            messageStatus = manualParams.get("MessageStatus");
-            numMedia = Number(manualParams.get("NumMedia") || "0");
-            messageSid = manualParams.get("MessageSid") || manualParams.get("SmsSid");
+        // If parsing failed (all data in one key), try to fix it
+        if (allKeys.length === 1 && allKeys[0].length > 100 && !params.get(allKeys[0])) {
+          console.log("Parsing falló, el body completo está en una clave. Intentando fix...");
+          const singleKey = allKeys[0];
+          
+          // Try to decode if it looks like base64
+          let decodedBody = singleKey;
+          try {
+            if (/^[A-Za-z0-9+/]+=*$/.test(singleKey)) {
+              decodedBody = Buffer.from(singleKey, 'base64').toString('utf8');
+              console.log("Body decodificado de base64:", decodedBody);
+            }
+          } catch (e) {
+            console.log("No es base64 válido, usando como está");
           }
-        } else {
-          // Parsing normal funcionó
-          from = params.get("From");
-          waid = params.get("WaId");
-          body = params.get("Body");
-          smsStatus = (params.get("SmsStatus") || "").toLowerCase();
-          messageStatus = params.get("MessageStatus");
-          numMedia = Number(params.get("NumMedia") || "0");
-          messageSid = params.get("MessageSid") || params.get("SmsSid");
+          
+          // Re-parse with the potentially decoded body
+          params = new URLSearchParams(decodedBody);
+          allKeys = Array.from(params.keys());
+          console.log("Claves después de re-parsing:", allKeys);
+        }
+        
+        // Extract the parameters
+        let from = params.get("From");
+        let waid = params.get("WaId");
+        let body = params.get("Body");
+        let smsStatus = (params.get("SmsStatus") || "").toLowerCase();
+        let messageStatus = params.get("MessageStatus");
+        let numMedia = Number(params.get("NumMedia") || "0");
+        let messageSid = params.get("MessageSid") || params.get("SmsSid");
+        
+        // URL decode the From field if it's encoded
+        if (from && from.includes('%')) {
+          from = decodeURIComponent(from);
         }
         
         console.log("Datos extraídos:", { 
@@ -329,9 +338,21 @@ export const handler = async (event) => {
     } else if (twilioData) {
       isWhatsApp = true;
       isTwilio = true;
-      phone = (twilioData.From || "").replace(/^whatsapp:/, "");
-      const waid = twilioData.WaId || phone;
-      userId = `wa:${normalizePhone(waid || phone)}`;
+      // Extract phone number properly, handling URL encoding and whatsapp: prefix
+      const rawFrom = twilioData.From || "";
+      const rawWaId = twilioData.WaId || "";
+      
+      // Try WaId first (it's usually cleaner), then fall back to From
+      phone = rawWaId || rawFrom.replace(/^whatsapp:/, "");
+      
+      // Ensure we have a valid phone number
+      const normalizedPhone = normalizePhone(phone);
+      if (normalizedPhone) {
+        userId = `wa:${normalizedPhone}`;
+      } else {
+        console.error("No se pudo extraer número de teléfono válido:", { rawFrom, rawWaId, phone });
+        userId = "anon";
+      }
       inputText = (twilioData.Body || "").trim();
       messageId = twilioData.MessageSid; // Usar MessageSid como messageId único
       
