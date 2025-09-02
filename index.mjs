@@ -246,6 +246,8 @@ const transcribeAudio = async (audioS3Url, audioFormat = 'ogg') => {
     const serviceHealthy = await checkTranscribeServiceHealth();
     if (!serviceHealthy) {
       console.error('[TRANSCRIBE] ❌ Servicio no disponible, abortando transcripción');
+      // Ejecutar diagnóstico adicional
+      await quickTranscribeDiagnostic();
       return null;
     }
     
@@ -436,6 +438,34 @@ const logTranscriptionAttempt = (audioUrl, audioFormat, success, error = null, t
   
   console.log(`[TRANSCRIBE_LOG] ${JSON.stringify(logData)}`);
   return logData;
+};
+
+// Función de diagnóstico rápido para AWS Transcribe
+const quickTranscribeDiagnostic = async () => {
+  try {
+    console.log('[DIAGNOSTIC] 🔍 Iniciando diagnóstico rápido de AWS Transcribe...');
+    
+    // Verificar permisos básicos
+    const { ListTranscriptionJobsCommand } = await import("@aws-sdk/client-transcribe");
+    const listCommand = new ListTranscriptionJobsCommand({ MaxResults: 3 });
+    const result = await transcribe.send(listCommand);
+    
+    console.log('[DIAGNOSTIC] ✅ Permisos de Transcribe verificados');
+    console.log(`[DIAGNOSTIC] 📊 Trabajos recientes encontrados: ${result.TranscriptionJobSummaries?.length || 0}`);
+    
+    if (result.TranscriptionJobSummaries?.length > 0) {
+      result.TranscriptionJobSummaries.forEach((job, i) => {
+        console.log(`[DIAGNOSTIC] ${i+1}. ${job.TranscriptionJobName} - ${job.TranscriptionJobStatus} (${job.LanguageCode || 'N/A'})`);
+      });
+    }
+    
+    return true;
+  } catch (error) {
+    console.error('[DIAGNOSTIC] ❌ Error en diagnóstico:', error);
+    console.error('[DIAGNOSTIC] Tipo:', error.name);
+    console.error('[DIAGNOSTIC] Mensaje:', error.message);
+    return false;
+  }
 };
 
 export const handler = async (event) => {
@@ -765,6 +795,54 @@ export const handler = async (event) => {
           console.error('[AUDIO] Error stack:', e.stack);
           inputText = "He recibido tu mensaje de audio pero hubo un error al procesarlo. ¿Podrías escribirme o intentar de nuevo?";
         }
+      }
+    }
+
+    // Comando especial para diagnóstico de transcripción
+    if (inputText === 'DIAGNOSTIC_TRANSCRIBE' || inputText === '/diagnostic') {
+      console.log('[DIAGNOSTIC] 🔧 Comando de diagnóstico activado por usuario');
+      
+      try {
+        await quickTranscribeDiagnostic();
+        
+        // Verificar servicio de transcripción
+        const healthCheck = await checkTranscribeServiceHealth();
+        
+        const diagnosticMessages = [
+          "🔧 **Diagnóstico de Transcripción Ejecutado**",
+          healthCheck ? "✅ Servicio AWS Transcribe: DISPONIBLE" : "❌ Servicio AWS Transcribe: NO DISPONIBLE",
+          `📍 Región AWS: ${REGION}`,
+          `🗂️ Bucket S3: ${MEDIA_BUCKET}`,
+          "",
+          "📋 **Próximos pasos:**",
+          "1. Envía un mensaje de audio para probar",
+          "2. Revisa los logs detallados en CloudWatch",
+          "3. Verifica permisos IAM si hay errores"
+        ];
+        
+        return {
+          statusCode: 200,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            reply: diagnosticMessages.map(msg => ({ type: "text", text: msg })),
+            history: history
+          })
+        };
+        
+      } catch (diagError) {
+        console.error('[DIAGNOSTIC] Error ejecutando diagnóstico:', diagError);
+        
+        return {
+          statusCode: 200,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            reply: [
+              { type: "text", text: "❌ Error ejecutando diagnóstico" },
+              { type: "text", text: `Detalles: ${diagError.message}` }
+            ],
+            history: history
+          })
+        };
       }
     }
 
