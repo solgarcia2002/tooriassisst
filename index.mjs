@@ -112,6 +112,9 @@ const loadHistory = async (userId) => {
     const res = await s3.send(new GetObjectCommand({ Bucket: HISTORY_BUCKET, Key: key }));
     const body = await streamToString(res.Body);
     const parsed = JSON.parse(body);
+    
+    console.log(`[DEBUG] Historial cargado para ${userId}:`, JSON.stringify(parsed, null, 2));
+    
     return Array.isArray(parsed) ? parsed : [];
   } catch (e) {
     if (DEBUG_S3) console.warn("[S3][GET] vacío o error:", e?.name, e?.message);
@@ -122,6 +125,9 @@ const loadHistory = async (userId) => {
 const saveHistory = async (userId, history) => {
   const key = `history/${encodeURIComponent(userId)}.json`;
   const body = JSON.stringify(history);
+  
+  console.log(`[DEBUG] Guardando en S3 para ${userId}:`, JSON.stringify(history, null, 2));
+  
   if (DEBUG_S3) console.log("[S3][PUT]", HISTORY_BUCKET, key, "bytes:", Buffer.byteLength(body));
   await s3.send(new PutObjectCommand({
     Bucket: HISTORY_BUCKET,
@@ -206,6 +212,9 @@ export const handler = async (event) => {
     const headers = event.headers || {};
     const ct = (headers["content-type"] || headers["Content-Type"] || "").toLowerCase();
 
+    console.log("Raw body:", rawBody);
+    console.log("Headers:", headers);
+
     let metaMsg = null;
     if (rawBody && ct.includes("application/json")) {
       try {
@@ -217,29 +226,79 @@ export const handler = async (event) => {
     }
 
     let twilioData = null;
-    if (!metaMsg && rawBody) {
+    if (!metaMsg && rawBody && ct.includes("application/x-www-form-urlencoded")) {
       try {
+        console.log("Procesando datos de Twilio...");
+        console.log("Raw body length:", rawBody.length);
+        console.log("Raw body sample:", rawBody.substring(0, 200));
+        
+        // Parsear los parámetros del form
         const params = new URLSearchParams(rawBody);
-        const from = params.get("From");
-        const waid = params.get("WaId");
-        const body = params.get("Body");
-        const smsStatus = (params.get("SmsStatus") || "").toLowerCase();
-        const messageStatus = params.get("MessageStatus");
-        const numMedia = Number(params.get("NumMedia") || "0");
+        
+        // Debug: mostrar todas las claves encontradas
+        const allKeys = Array.from(params.keys());
+        console.log("Claves encontradas:", allKeys);
+        
+        // Si no hay claves válidas, intentar con el primer key como string completo
+        let from, waid, body, smsStatus, messageStatus, numMedia, messageSid;
+        
+        if (allKeys.length === 0 || (allKeys.length === 1 && allKeys[0].length > 100)) {
+          // El parsing falló, probablemente todo está en una sola clave
+          console.log("Parsing falló, intentando recuperar datos...");
+          const singleKey = allKeys[0] || '';
+          if (singleKey.includes('From=') || singleKey.includes('WaId=')) {
+            // Intentar parsear manualmente
+            const manualParams = new URLSearchParams(singleKey);
+            from = manualParams.get("From");
+            waid = manualParams.get("WaId");
+            body = manualParams.get("Body");
+            smsStatus = (manualParams.get("SmsStatus") || "").toLowerCase();
+            messageStatus = manualParams.get("MessageStatus");
+            numMedia = Number(manualParams.get("NumMedia") || "0");
+            messageSid = manualParams.get("MessageSid") || manualParams.get("SmsSid");
+          }
+        } else {
+          // Parsing normal funcionó
+          from = params.get("From");
+          waid = params.get("WaId");
+          body = params.get("Body");
+          smsStatus = (params.get("SmsStatus") || "").toLowerCase();
+          messageStatus = params.get("MessageStatus");
+          numMedia = Number(params.get("NumMedia") || "0");
+          messageSid = params.get("MessageSid") || params.get("SmsSid");
+        }
+        
+        console.log("Datos extraídos:", { 
+          from, 
+          waid, 
+          body, 
+          smsStatus, 
+          messageStatus, 
+          numMedia,
+          messageSid
+        });
+        
         const isInbound = (smsStatus === "received") || !!body || numMedia > 0;
         if ((from || waid) && isInbound && !messageStatus) {
           const medias = [];
           for (let i = 0; i < numMedia; i++) {
-            medias.push({
-              url: params.get(`MediaUrl${i}`),
-              contentType: params.get(`MediaContentType${i}`)
-            });
+            const mediaUrl = params.get(`MediaUrl${i}`) || (allKeys.length === 1 ? new URLSearchParams(allKeys[0]).get(`MediaUrl${i}`) : null);
+            const mediaContentType = params.get(`MediaContentType${i}`) || (allKeys.length === 1 ? new URLSearchParams(allKeys[0]).get(`MediaContentType${i}`) : null);
+            if (mediaUrl) {
+              medias.push({
+                url: mediaUrl,
+                contentType: mediaContentType
+              });
+            }
           }
-          twilioData = { From: from, WaId: waid, Body: body || "", medias };
+          twilioData = { From: from, WaId: waid, Body: body || "", medias, MessageSid: messageSid };
+          console.log("TwilioData creado:", twilioData);
         } else {
-          if (DEBUG_TWILIO) console.log("[Twilio] Ignorado (no inbound):", { from, waid, smsStatus, messageStatus, numMedia });
+          console.log("[Twilio] Mensaje ignorado:", { from, waid, smsStatus, messageStatus, numMedia, isInbound });
         }
-      } catch {}
+      } catch (e) {
+        console.error("Error parsing Twilio data:", e);
+      }
     }
 
     if (metaMsg) {
@@ -272,8 +331,29 @@ export const handler = async (event) => {
       isTwilio = true;
       phone = (twilioData.From || "").replace(/^whatsapp:/, "");
       const waid = twilioData.WaId || phone;
-      userId = `wa:${normalizePhone(waid)}`;
+      userId = `wa:${normalizePhone(waid || phone)}`;
       inputText = (twilioData.Body || "").trim();
+      messageId = twilioData.MessageSid; // Usar MessageSid como messageId único
+      
+      console.log("Phone:", phone, "UserId:", userId);
+      
+      // Load history first to check for duplicate messages
+      history = await loadHistory(userId);
+      
+      // Check if this message was already processed using MessageSid
+      if (messageId) {
+        const recentMessages = history.slice(-10); // Check last 10 messages
+        const isDuplicate = recentMessages.some(msg => 
+          msg.role === "user" && 
+          msg.messageId === messageId
+        );
+        
+        if (isDuplicate) {
+          console.log(`[DEBUG] Mensaje Twilio duplicado detectado: ${messageId}`);
+          return { statusCode: 200, body: JSON.stringify({ status: "DUPLICATE_IGNORED" }) };
+        }
+      }
+      
       if (DEBUG_TWILIO) console.log("[Twilio] From:", twilioData.From, "WaId:", twilioData.WaId, "userId:", userId, "Body:", inputText);
       try {
         for (const m of (twilioData.medias || [])) {
@@ -284,7 +364,6 @@ export const handler = async (event) => {
           imagenesS3.push(await putMedia(buf, mime, userId, ext));
         }
       } catch (e) { console.warn("Twilio media:", e?.message || e); }
-      history = await loadHistory(userId);
     } else {
       const parsed = rawBody ? JSON.parse(rawBody) : {};
       inputText = typeof parsed.input === "string" ? parsed.input : parsed.input?.text;
@@ -314,6 +393,12 @@ export const handler = async (event) => {
     }
 
     console.log(`[DEBUG] InputText: "${inputText}", UserId: ${userId}, HistoryLength: ${history.length}`);
+    
+    // Debug: mostrar estructura del historial
+    if (history.length > 0) {
+      console.log(`[DEBUG] Último mensaje del historial:`, JSON.stringify(history[history.length - 1], null, 2));
+      console.log(`[DEBUG] Historial completo:`, JSON.stringify(history, null, 2));
+    }
 
     const baseHistory = Array.isArray(history) ? history : [];
     const safeHistory = trimHistory(baseHistory);
@@ -380,7 +465,13 @@ export const handler = async (event) => {
     }
 
     let newHistory = [...updatedMessages];
-    newHistory.push({ role: "assistant", content: [{ type: "text", text: salidaSinJson }] });
+    const assistantMessage = { role: "assistant", content: [{ type: "text", text: salidaSinJson }] };
+    newHistory.push(assistantMessage);
+    
+    console.log(`[DEBUG] Guardando historial para ${userId}:`);
+    console.log(`[DEBUG] Nuevo mensaje asistente:`, JSON.stringify(assistantMessage, null, 2));
+    console.log(`[DEBUG] Historial completo a guardar:`, JSON.stringify(newHistory, null, 2));
+    
     try { await saveHistory(userId, newHistory); } catch (e) { console.error("S3 save err:", e?.message || e); }
 
     if (isWhatsApp) {
@@ -413,6 +504,9 @@ export const handler = async (event) => {
     }
 
     const assistantReply = mensajes.map(text => ({ type: "text", text }));
+    
+    console.log("Respuesta backend:", JSON.stringify({ reply: assistantReply, history: newHistory }, null, 2));
+    
     return { statusCode: 200, body: JSON.stringify({ reply: assistantReply, history: newHistory }) };
 
   } catch (err) {
