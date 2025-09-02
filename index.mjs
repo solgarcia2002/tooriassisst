@@ -225,17 +225,21 @@ export const handler = async (event) => {
       const parsed = rawBody ? JSON.parse(rawBody) : {};
       inputText = typeof parsed.input === "string" ? parsed.input : parsed.input?.text;
       
-      // Mantener sesión persistente para web usando sessionId o crear uno nuevo si no existe
-      const sessionId = parsed.sessionId || 
-                       parsed.userId || 
-                       parsed?.requestContext?.requestId || 
-                       `session-${Date.now()}-${crypto.randomUUID().slice(0,8)}`;
-      userId = `web:${sessionId}`;
+      // Detectar si es una nueva sesión o continuación
+      const isNewSession = !parsed.sessionId; // Si no hay sessionId, es una nueva sesión (recarga)
       
-      // Siempre cargar historial para mantener contexto
-      history = await loadHistory(userId);
-      
-      console.log(`[DEBUG] Web session - SessionId: ${sessionId}, UserId: ${userId}, History loaded: ${history.length} messages`);
+      if (isNewSession) {
+        // Nueva sesión (recarga de página) - crear nuevo ID único
+        const newSessionId = `session-${Date.now()}-${crypto.randomUUID().slice(0,8)}`;
+        userId = `web:${newSessionId}`;
+        history = []; // Iniciar con historial vacío
+        console.log(`[DEBUG] NEW SESSION - SessionId: ${newSessionId}, Starting fresh conversation`);
+      } else {
+        // Continuación de sesión existente - mantener contexto
+        userId = `web:${parsed.sessionId}`;
+        history = await loadHistory(userId);
+        console.log(`[DEBUG] CONTINUING SESSION - SessionId: ${parsed.sessionId}, History loaded: ${history.length} messages`);
+      }
     }
 
     // si no hay texto ni media -> registrar como mensaje vacío pero continuar conversación
@@ -248,6 +252,18 @@ export const handler = async (event) => {
 
     // ===== Análisis del estado de la conversación =====
     const analyzeConversationState = (history) => {
+      // Si no hay historial, es una conversación nueva
+      if (!history || history.length === 0) {
+        return {
+          hasName: false,
+          hasAddress: false,
+          hasProblem: false,
+          hasUrgency: false,
+          isGreeted: false,
+          isNewConversation: true
+        };
+      }
+      
       const userMessages = history.filter(msg => msg.role === "user").map(msg => 
         msg.content?.[0]?.text || ""
       ).join(" ").toLowerCase();
@@ -257,22 +273,29 @@ export const handler = async (event) => {
       ).join(" ").toLowerCase();
       
       return {
-        hasName: /nombre|llamo|soy\s+\w+/.test(userMessages) || /tu nombre|cómo te llam/.test(assistantMessages),
-        hasAddress: /dirección|domicilio|vivo en|casa/.test(userMessages) || /dirección|domicilio/.test(assistantMessages),
-        hasProblem: /problema|roto|no funciona|se rompió/.test(userMessages) || /qué pasó|problema/.test(assistantMessages),
+        hasName: /soy\s+\w+|me llamo|mi nombre es|\b\w+\s+(garcia|martinez|lopez|fernandez|rodriguez|gonzalez|perez|sanchez)\b/.test(userMessages) || /tu nombre|cómo te llam|apellido/.test(assistantMessages),
+        hasAddress: /dirección|domicilio|vivo en|casa|calle|avenida|av\s/.test(userMessages) || /dirección|domicilio/.test(assistantMessages),
+        hasProblem: /problema|roto|no funciona|se rompió|canilla|inodoro|luz|gas/.test(userMessages) || /qué pasó|problema/.test(assistantMessages),
         hasUrgency: /urgente|ya|ahora|rápido/.test(userMessages) || /urgente/.test(assistantMessages),
-        isGreeted: assistantMessages.includes("hola") || assistantMessages.includes("buenas")
+        isGreeted: assistantMessages.includes("hola") || assistantMessages.includes("buenas") || assistantMessages.includes("toori"),
+        isNewConversation: false
       };
     };
     
-    const conversationState = analyzeConversationState(baseHistory);
+    const conversationState = analyzeConversationState(history);
     console.log(`[DEBUG] Conversation state:`, conversationState);
 
     // ===== Prompt del sistema dinámico =====
     const buildSystemPrompt = (state) => {
       let contextualInstructions = "";
       
-      if (state.hasName && state.hasAddress && state.hasProblem) {
+      if (state.isNewConversation) {
+        contextualInstructions = `
+NUEVA CONVERSACIÓN: Esta es una conversación completamente nueva.
+- Empezá con el saludo inicial completo
+- No asumas información previa
+- Seguí la secuencia desde el paso 1`;
+      } else if (state.hasName && state.hasAddress && state.hasProblem) {
         contextualInstructions = `
 IMPORTANTE: El usuario ya proporcionó información básica. NO vuelvas a preguntar por:
 - Su nombre (ya lo tiene)
