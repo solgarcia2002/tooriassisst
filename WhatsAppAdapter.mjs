@@ -32,6 +32,13 @@ const isAudio = (contentType) => {
 };
 
 const getTwilioAuth = () => {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+    console.error('[AUTH] Missing Twilio credentials:', {
+      accountSid: TWILIO_ACCOUNT_SID ? 'present' : 'missing',
+      authToken: TWILIO_AUTH_TOKEN ? 'present' : 'missing'
+    });
+    throw new Error('Missing Twilio credentials');
+  }
   return "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
 };
 
@@ -187,14 +194,28 @@ const isTwilioMessage = (form) => {
 // ==========================================
 
 const downloadMedia = async (mediaUrl) => {
-  const response = await fetch(mediaUrl, { 
-    headers: { Authorization: getTwilioAuth() } 
-  });
-  if (!response.ok) {
-    throw new Error(`Download failed: ${response.status}`);
+  try {
+    const authHeader = getTwilioAuth();
+    console.log(`[MEDIA] Downloading from: ${mediaUrl}`);
+    console.log(`[MEDIA] Auth header length: ${authHeader.length}`);
+    
+    const response = await fetch(mediaUrl, { 
+      headers: { Authorization: authHeader } 
+    });
+    
+    if (!response.ok) {
+      console.error(`[MEDIA] Download failed: ${response.status} ${response.statusText}`);
+      console.error(`[MEDIA] Response headers:`, Object.fromEntries(response.headers.entries()));
+      throw new Error(`Download failed: ${response.status}`);
+    }
+    
+    const buffer = await response.arrayBuffer();
+    console.log(`[MEDIA] Downloaded ${buffer.byteLength} bytes`);
+    return Buffer.from(buffer);
+  } catch (error) {
+    console.error(`[MEDIA] Error downloading media:`, error);
+    throw error;
   }
-  const buffer = await response.arrayBuffer();
-  return Buffer.from(buffer);
 };
 
 const uploadToS3 = async (buffer, contentType, userId) => {
@@ -396,6 +417,12 @@ const addToHistory = (userId, message) => {
 
 export const handler = async (event) => {
   console.log('Processing message...');
+  console.log('[ENV] Environment check:', {
+    twilioAccountSid: TWILIO_ACCOUNT_SID ? 'present' : 'missing',
+    twilioAuthToken: TWILIO_AUTH_TOKEN ? 'present' : 'missing',
+    phoneNumberId: PHONE_NUMBER_ID ? 'present' : 'missing',
+    whatsappToken: WHATSAPP_TOKEN ? 'present' : 'missing'
+  });
   
   // Handle webhook verification for Meta WhatsApp
   if (event.httpMethod === 'GET' && event.queryStringParameters) {
