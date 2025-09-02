@@ -3,6 +3,10 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { TranscribeClient, StartTranscriptionJobCommand, GetTranscriptionJobCommand } from "@aws-sdk/client-transcribe";
 import crypto from "crypto";
 
+// ==========================================
+// CONFIGURATION & CLIENTS
+// ==========================================
+
 // Normalize phone number to match index.mjs format
 const normalizePhone = (s) => (s || "").replace(/\D/g, "");
 
@@ -17,17 +21,261 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const s3 = new S3Client({ region: REGION });
 const transcribe = new TranscribeClient({ region: REGION });
 
-const memory = {}; // Historial temporal por usuario
+// In-memory storage for conversation history
+const memory = {};
 
-// Twilio authentication
-const twilioBasicAuth = () =>
+// ==========================================
+// UTILITY METHODS
+// ==========================================
+
+/**
+ * Enhanced logging for debugging conversation threads
+ */
+const logConversationState = (userId, action, details = {}) => {
+  console.log(`[CONVERSATION_THREAD] ${action} - UserId: ${userId}`, details);
+};
+
+/**
+ * Check if content type is audio
+ */
+const isAudioFile = (contentType) => {
+  if (!contentType) return false;
+  const audioTypes = ['audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/webm', 'audio/aac'];
+  return audioTypes.some(type => contentType.toLowerCase().includes(type.split('/')[1]));
+};
+
+/**
+ * Twilio authentication header
+ */
+const getTwilioAuthHeader = () =>
   "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
 
-// Download media from Twilio
+// ==========================================
+// FORM PARSING METHODS
+// ==========================================
+
+/**
+ * Try to decode Base64 encoded form data
+ */
+const tryDecodeBase64Form = (singleKey) => {
+  try {
+    if (/^[A-Za-z0-9+/]+=*$/.test(singleKey)) {
+      const decodedBody = Buffer.from(singleKey, 'base64').toString('utf8');
+      console.log('Successfully decoded Base64 body:', decodedBody);
+      return querystring.parse(decodedBody);
+    }
+  } catch (error) {
+    console.log('Base64 decoding failed:', error.message);
+  }
+  return null;
+};
+
+/**
+ * Emergency parsing fallback for malformed data
+ */
+const tryEmergencyParsing = (bodyToParse) => {
+  try {
+    const emergencyParsed = {};
+    const matches = bodyToParse.match(/(\w+)=([^&]*)/g);
+    if (matches) {
+      matches.forEach(match => {
+        const [key, value] = match.split('=');
+        emergencyParsed[key] = decodeURIComponent(value || '');
+      });
+      console.log('Emergency parsing successful:', Object.keys(emergencyParsed));
+      return emergencyParsed;
+    }
+  } catch (error) {
+    console.log('Emergency parsing also failed:', error.message);
+  }
+  return null;
+};
+
+/**
+ * Parse form data from request body
+ */
+const parseFormData = (event) => {
+  let form;
+  let messageId = null;
+
+  try {
+    if (event.headers['content-type']?.includes('application/json')) {
+      form = JSON.parse(event.body);
+      // Extract message ID from WhatsApp webhook format
+      const metaMsg = form?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+      messageId = metaMsg?.id || null;
+    } else {
+      // Handle Twilio form data which might be Base64 encoded
+      let bodyToParse = event.body;
+      
+      // First try to parse normally
+      let parsed = querystring.parse(bodyToParse);
+      let allKeys = Object.keys(parsed);
+      
+      console.log('Initial parsing - Keys found:', allKeys.length);
+      console.log('First key sample:', allKeys[0]?.substring(0, 100));
+      
+      // If we have only one key and it looks like Base64 encoded data
+      if (allKeys.length === 1 && allKeys[0].length > 100 && 
+          (!parsed[allKeys[0]] || parsed[allKeys[0]] === '' || parsed[allKeys[0]] === '=')) {
+        const singleKey = allKeys[0];
+        console.log('Detected potential Base64 encoded form data');
+        
+        const base64Parsed = tryDecodeBase64Form(singleKey);
+        if (base64Parsed) {
+          parsed = base64Parsed;
+          allKeys = Object.keys(parsed);
+          console.log('After Base64 decoding - Keys found:', allKeys.length);
+        }
+      }
+      
+      // If still not parsed correctly, try emergency parsing
+      if (allKeys.length <= 1) {
+        const emergencyParsed = tryEmergencyParsing(bodyToParse);
+        if (emergencyParsed) {
+          parsed = emergencyParsed;
+        }
+      }
+      
+      form = parsed;
+    }
+  } catch (error) {
+    console.error('Error parsing form data:', error);
+    form = {};
+  }
+
+  return { form, messageId };
+};
+
+// ==========================================
+// USER EXTRACTION METHODS  
+// ==========================================
+
+/**
+ * Extract user info from Twilio format
+ */
+const extractFromTwilioFormat = (form) => {
+  if (!form?.From && !form?.WaId) return null;
+
+  let phone, userId;
+  const phoneNumberId = PHONE_NUMBER_ID;
+
+  if (form.From) {
+    phone = form.From.replace(/^whatsapp:/, "");
+    const waid = form?.WaId || phone;
+    const normalizedPhone = normalizePhone(waid);
+    userId = `wa:${normalizedPhone}`;
+    
+    logConversationState(userId, 'PHONE_EXTRACTED', { 
+      originalFrom: form.From, 
+      phone, 
+      waid, 
+      normalizedPhone,
+      phoneNumberId 
+    });
+  } else if (form.WaId) {
+    const waid = form.WaId;
+    const normalizedPhone = normalizePhone(waid);
+    userId = `wa:${normalizedPhone}`;
+    phone = `+${normalizedPhone}`;
+    
+    logConversationState(userId, 'PHONE_EXTRACTED', { 
+      originalFrom: null, 
+      phone, 
+      waid, 
+      normalizedPhone,
+      phoneNumberId 
+    });
+  }
+
+  return { phone, userId, phoneNumberId };
+};
+
+/**
+ * Extract user info from malformed form key
+ */
+const extractFromMalformedKey = (form) => {
+  if (Object.keys(form).length !== 1) return null;
+
+  const singleKey = Object.keys(form)[0];
+  const fromMatch = singleKey.match(/From=whatsapp%3A%2B(\d+)/);
+  const waidMatch = singleKey.match(/WaId=(\d+)/);
+  
+  if (fromMatch || waidMatch) {
+    const normalizedPhone = normalizePhone(fromMatch?.[1] || waidMatch?.[1]);
+    const userId = `wa:${normalizedPhone}`;
+    const phone = `+${normalizedPhone}`;
+    const phoneNumberId = PHONE_NUMBER_ID;
+    
+    console.log(`Phone extracted from malformed ${fromMatch ? 'From' : 'WaId'} field:`, { normalizedPhone, userId });
+    
+    return { phone, userId, phoneNumberId };
+  }
+
+  return null;
+};
+
+/**
+ * Extract user info from Meta WhatsApp webhook
+ */
+const extractFromMetaWebhook = (form) => {
+  if (!form?.entry?.[0]?.changes?.[0]?.value) return null;
+
+  const value = form.entry[0].changes[0].value;
+  const contact = value.contacts?.[0];
+  const message = value.messages?.[0];
+
+  if (contact?.wa_id || message?.from) {
+    const waid = contact?.wa_id || message?.from;
+    const phone = waid;
+    const normalizedPhone = normalizePhone(waid);
+    const userId = `wa:${normalizedPhone}`;
+    const phoneNumberId = value.metadata?.phone_number_id || PHONE_NUMBER_ID;
+    
+    logConversationState(userId, 'META_WEBHOOK_PHONE_EXTRACTED', { 
+      waid, 
+      phone, 
+      normalizedPhone,
+      phoneNumberId,
+      metadataPhoneId: value.metadata?.phone_number_id
+    });
+
+    return { phone, userId, phoneNumberId };
+  }
+
+  return null;
+};
+
+/**
+ * Extract user information from form data
+ */
+const extractUserInfo = (form) => {
+  // Try different extraction methods in order of preference
+  let userInfo = extractFromTwilioFormat(form) || 
+                 extractFromMalformedKey(form) || 
+                 extractFromMetaWebhook(form);
+
+  // Fallback to anonymous if extraction failed
+  if (!userInfo) {
+    userInfo = { phone: null, userId: 'anon', phoneNumberId: PHONE_NUMBER_ID };
+  }
+
+  console.log('Phone:', userInfo.phone, 'UserId:', userInfo.userId, 'PhoneNumberId:', userInfo.phoneNumberId);
+  
+  return userInfo;
+};
+
+// ==========================================
+// MEDIA PROCESSING METHODS
+// ==========================================
+
+/**
+ * Download media from Twilio
+ */
 const downloadTwilioMedia = async (mediaUrl) => {
   console.log(`[AUDIO] Descargando audio desde Twilio: ${mediaUrl}`);
   const response = await fetch(mediaUrl, { 
-    headers: { Authorization: twilioBasicAuth() } 
+    headers: { Authorization: getTwilioAuthHeader() } 
   });
   if (!response.ok) {
     throw new Error(`Error descargando audio de Twilio: ${response.status}`);
@@ -36,33 +284,81 @@ const downloadTwilioMedia = async (mediaUrl) => {
   return Buffer.from(arrayBuffer);
 };
 
-// Upload media to S3
-const putMediaToS3 = async (buffer, contentType, userId, extension) => {
+/**
+ * Upload media to S3
+ */
+const uploadMediaToS3 = async (buffer, contentType, userId, extension) => {
   const fileName = `media/${userId}/${crypto.randomUUID()}.${extension}`;
-  const key = fileName;
   
-  console.log(`[AUDIO] Subiendo audio a S3: ${key}`);
+  console.log(`[AUDIO] Subiendo audio a S3: ${fileName}`);
   
   await s3.send(new PutObjectCommand({
     Bucket: MEDIA_BUCKET,
-    Key: key,
+    Key: fileName,
     Body: buffer,
     ContentType: contentType,
     Metadata: { userId }
   }));
   
-  const url = `https://${MEDIA_BUCKET}.s3.${REGION}.amazonaws.com/${key}`;
+  const url = `https://${MEDIA_BUCKET}.s3.${REGION}.amazonaws.com/${fileName}`;
   console.log(`[AUDIO] Audio subido a S3: ${url}`);
   
   return {
     url,
-    key,
+    key: fileName,
     contentType,
     size: buffer.length
   };
 };
 
-// Transcribe audio using Amazon Transcribe
+/**
+ * Wait for transcription job to complete
+ */
+const waitForTranscriptionCompletion = async (jobName, maxAttempts = 30) => {
+  let jobStatus = 'IN_PROGRESS';
+  let attempts = 0;
+  
+  while (jobStatus === 'IN_PROGRESS' && attempts < maxAttempts) {
+    await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
+    attempts++;
+    
+    const getJobCommand = new GetTranscriptionJobCommand({
+      TranscriptionJobName: jobName
+    });
+    
+    const result = await transcribe.send(getJobCommand);
+    jobStatus = result.TranscriptionJob.TranscriptionJobStatus;
+    
+    console.log(`[TRANSCRIBE] Estado del trabajo (${attempts}/${maxAttempts}): ${jobStatus}`);
+    
+    if (jobStatus === 'COMPLETED') {
+      const transcriptUri = result.TranscriptionJob.Transcript.TranscriptFileUri;
+      console.log(`[TRANSCRIBE] Descargando transcript desde: ${transcriptUri}`);
+      
+      const transcriptResponse = await fetch(transcriptUri);
+      const transcriptData = await transcriptResponse.json();
+      
+      const transcribedText = transcriptData.results.transcripts[0]?.transcript || '';
+      console.log(`[TRANSCRIBE] Texto transcrito: "${transcribedText}"`);
+      
+      return transcribedText;
+    } else if (jobStatus === 'FAILED') {
+      console.error(`[TRANSCRIBE] Trabajo falló: ${result.TranscriptionJob.FailureReason}`);
+      return null;
+    }
+  }
+  
+  if (jobStatus === 'IN_PROGRESS') {
+    console.error('[TRANSCRIBE] Timeout: El trabajo de transcripción tomó demasiado tiempo');
+    return null;
+  }
+  
+  return null;
+};
+
+/**
+ * Transcribe audio using Amazon Transcribe
+ */
 const transcribeAudio = async (audioS3Url, audioFormat = 'ogg') => {
   try {
     console.log(`[TRANSCRIBE] Iniciando transcripción de: ${audioS3Url}`);
@@ -87,45 +383,8 @@ const transcribeAudio = async (audioS3Url, audioFormat = 'ogg') => {
     await transcribe.send(startJobCommand);
     console.log(`[TRANSCRIBE] Trabajo iniciado: ${jobName}`);
     
-    // Wait for transcription to complete
-    let jobStatus = 'IN_PROGRESS';
-    let attempts = 0;
-    const maxAttempts = 30; // 30 attempts * 2 seconds = 60 seconds max
-    
-    while (jobStatus === 'IN_PROGRESS' && attempts < maxAttempts) {
-      await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
-      attempts++;
-      
-      const getJobCommand = new GetTranscriptionJobCommand({
-        TranscriptionJobName: jobName
-      });
-      
-      const result = await transcribe.send(getJobCommand);
-      jobStatus = result.TranscriptionJob.TranscriptionJobStatus;
-      
-      console.log(`[TRANSCRIBE] Estado del trabajo (${attempts}/${maxAttempts}): ${jobStatus}`);
-      
-      if (jobStatus === 'COMPLETED') {
-        const transcriptUri = result.TranscriptionJob.Transcript.TranscriptFileUri;
-        console.log(`[TRANSCRIBE] Descargando transcript desde: ${transcriptUri}`);
-        
-        const transcriptResponse = await fetch(transcriptUri);
-        const transcriptData = await transcriptResponse.json();
-        
-        const transcribedText = transcriptData.results.transcripts[0]?.transcript || '';
-        console.log(`[TRANSCRIBE] Texto transcrito: "${transcribedText}"`);
-        
-        return transcribedText;
-      } else if (jobStatus === 'FAILED') {
-        console.error(`[TRANSCRIBE] Trabajo falló: ${result.TranscriptionJob.FailureReason}`);
-        return null;
-      }
-    }
-    
-    if (jobStatus === 'IN_PROGRESS') {
-      console.error('[TRANSCRIBE] Timeout: El trabajo de transcripción tomó demasiado tiempo');
-      return null;
-    }
+    // Wait for completion
+    return await waitForTranscriptionCompletion(jobName);
     
   } catch (error) {
     console.error('[TRANSCRIBE] Error en transcripción:', error);
@@ -133,22 +392,177 @@ const transcribeAudio = async (audioS3Url, audioFormat = 'ogg') => {
   }
 };
 
-// Check if content type is audio
-const isAudioFile = (contentType) => {
-  if (!contentType) return false;
-  const audioTypes = ['audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/webm', 'audio/aac'];
-  return audioTypes.some(type => contentType.toLowerCase().includes(type.split('/')[1]));
+/**
+ * Extract media information from form
+ */
+const extractMediaInfo = (form) => {
+  const numMedia = parseInt(form?.NumMedia || '0');
+  const messageType = form?.MessageType;
+  
+  if (numMedia === 0 && messageType !== 'audio') {
+    return null;
+  }
+
+  console.log('Detected media message - NumMedia:', numMedia, 'MessageType:', messageType);
+  
+  const medias = [];
+  for (let i = 0; i < Math.max(numMedia, 1); i++) {
+    const mediaUrl = form[`MediaUrl${i}`];
+    const mediaContentType = form[`MediaContentType${i}`];
+    if (mediaUrl) {
+      medias.push({
+        url: mediaUrl,
+        contentType: mediaContentType
+      });
+      console.log(`Media ${i} found:`, { url: mediaUrl, contentType: mediaContentType });
+    }
+  }
+  
+  return medias.length > 0 ? { medias } : null;
 };
 
-// Enhanced logging for debugging conversation threads
-const logConversationState = (userId, action, details = {}) => {
-  console.log(`[CONVERSATION_THREAD] ${action} - UserId: ${userId}`, details);
+/**
+ * Process a single audio file
+ */
+const processAudioFile = async (audioMedia, userId) => {
+  console.log(`[AUDIO] Processing audio: ${audioMedia.url} (${audioMedia.contentType})`);
+  
+  // Download audio from Twilio
+  const audioBuffer = await downloadTwilioMedia(audioMedia.url);
+  
+  // Determine file extension
+  const audioExtension = audioMedia.contentType.split('/')[1] || 'ogg';
+  
+  // Use the extracted userId for S3 path, fallback to temp if not available
+  const s3UserId = userId || ('temp_' + Date.now());
+  
+  // Upload to S3
+  const s3AudioFile = await uploadMediaToS3(audioBuffer, audioMedia.contentType, s3UserId, audioExtension);
+  
+  // Transcribe the audio
+  const transcribedText = await transcribeAudio(s3AudioFile.url, audioExtension);
+  
+  return transcribedText;
 };
 
-// Backup conversation state to prevent loss
+/**
+ * Process audio media and return transcribed text
+ */
+const processAudioMedia = async (mediaInfo, userId) => {
+  if (!mediaInfo?.medias) {
+    return null;
+  }
+
+  console.log('Audio message detected, processing transcription...');
+  
+  try {
+    // Find the audio media
+    const audioMedia = mediaInfo.medias.find(m => isAudioFile(m.contentType));
+    if (!audioMedia) {
+      console.log('[AUDIO] No audio file found in media');
+      return 'He recibido un archivo multimedia pero no pude procesarlo como audio.';
+    }
+
+    const transcribedText = await processAudioFile(audioMedia, userId);
+    
+    if (transcribedText && transcribedText.trim()) {
+      console.log(`[AUDIO] Successfully transcribed: "${transcribedText}"`);
+      return transcribedText.trim();
+    } else {
+      console.log('[AUDIO] Transcription failed or empty');
+      return 'He recibido tu mensaje de audio pero no pude entender lo que dijiste. ¿Podrías escribirme o enviar el audio de nuevo?';
+    }
+  } catch (error) {
+    console.error('[AUDIO] Error processing audio:', error);
+    return 'He recibido tu mensaje de audio pero hubo un error al procesarlo. ¿Podrías escribirme o intentar de nuevo?';
+  }
+};
+
+// ==========================================
+// MESSAGE EXTRACTION METHODS
+// ==========================================
+
+/**
+ * Try to extract message from common body fields
+ */
+const extractFromBodyFields = (form) => {
+  if (form?.Body?.trim?.()) {
+    const message = form.Body.trim();
+    console.log('Message extracted from Twilio Body field:', message);
+    return message;
+  }
+  
+  const possibleBodyFields = ['body', 'message', 'Message', 'text', 'Text'];
+  for (const field of possibleBodyFields) {
+    if (form[field] && typeof form[field] === 'string' && form[field].trim()) {
+      console.log(`Message found in field ${field}:`, form[field]);
+      return form[field].trim();
+    }
+  }
+  
+  return null;
+};
+
+/**
+ * Try to extract message from Meta WhatsApp webhook format
+ */
+const extractFromMetaWebhookMessage = (form) => {
+  if (form?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.text?.body) {
+    const message = form.entry[0].changes[0].value.messages[0].text.body.trim();
+    console.log('Message extracted from Meta webhook format:', message);
+    return message;
+  }
+  return null;
+};
+
+/**
+ * Try to extract message from malformed form key
+ */
+const extractFromMalformedForm = (form) => {
+  if (Object.keys(form).length !== 1) return null;
+
+  const singleKey = Object.keys(form)[0];
+  const bodyMatch = singleKey.match(/Body=([^&]+)/);
+  if (bodyMatch) {
+    try {
+      const extractedMessage = decodeURIComponent(bodyMatch[1]);
+      console.log('Message extracted from malformed key:', extractedMessage);
+      return extractedMessage;
+    } catch (e) {
+      console.log('Failed to decode message from malformed key:', e.message);
+    }
+  }
+  
+  return null;
+};
+
+/**
+ * Extract text message from form data
+ */
+const extractTextMessage = (form) => {
+  // Try different extraction methods
+  let message = extractFromBodyFields(form) || 
+                extractFromMetaWebhookMessage(form) || 
+                extractFromMalformedForm(form);
+
+  if (!message) {
+    console.log('Standard extraction failed, trying fallback methods...');
+    console.log('Form keys available:', Object.keys(form));
+    console.log('No message found in any field. Full form structure:', JSON.stringify(form, null, 2));
+  }
+
+  return message;
+};
+
+// ==========================================
+// CONVERSATION MANAGEMENT METHODS
+// ==========================================
+
+/**
+ * Backup conversation state to prevent loss
+ */
 const backupConversation = (userId, history) => {
   try {
-    // Create a more persistent backup key
     const backupKey = `backup_${userId}_${Date.now()}`;
     memory[backupKey] = {
       userId,
@@ -173,7 +587,9 @@ const backupConversation = (userId, history) => {
   }
 };
 
-// Restore conversation from backup if main history is lost
+/**
+ * Restore conversation from backup if main history is lost
+ */
 const restoreConversation = (userId) => {
   try {
     const userBackups = Object.keys(memory)
@@ -195,472 +611,98 @@ const restoreConversation = (userId) => {
   return [];
 };
 
+/**
+ * Get conversation history for user
+ */
+const getConversationHistory = (userId) => {
+  if (memory[userId]) {
+    logConversationState(userId, 'HISTORY_RETRIEVED', { 
+      historyLength: memory[userId].length,
+      hasExistingConversation: true
+    });
+    return memory[userId];
+  } else {
+    const restored = restoreConversation(userId);
+    if (restored.length > 0) {
+      memory[userId] = restored;
+      return restored;
+    }
+    logConversationState(userId, 'HISTORY_RETRIEVED', { 
+      historyLength: 0,
+      hasExistingConversation: false
+    });
+    return [];
+  }
+};
+
+// ==========================================
+// MAIN HANDLER
+// ==========================================
+
 export const handler = async (event) => {
   console.log('Raw body:', event.body);
   console.log('Headers:', event.headers);
 
-  let form;
-  let messageId = null;
-
   try {
-    if (event.headers['content-type']?.includes('application/json')) {
-      form = JSON.parse(event.body);
-      // Extract message ID from WhatsApp webhook format
-      const metaMsg = form?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-      messageId = metaMsg?.id || null;
+    // 1. Parse form data
+    const { form, messageId } = parseFormData(event);
+    console.log('Form parseado OK:', form, 'MessageId:', messageId);
+
+    // 2. Extract user information
+    const { phone, userId, phoneNumberId } = extractUserInfo(form);
+
+    // 3. Extract media information
+    const mediaInfo = extractMediaInfo(form);
+
+    // 4. Process message content
+    let mensajeUsuario = 'mensaje vacío';
+
+    // Check if we have audio to process
+    if (mediaInfo && (form?.MessageType === 'audio' || mediaInfo.medias.some(m => isAudioFile(m.contentType)))) {
+      const transcribedText = await processAudioMedia(mediaInfo, userId);
+      if (transcribedText) {
+        mensajeUsuario = transcribedText;
+      }
     } else {
-      // Handle Twilio form data which might be Base64 encoded
-      let bodyToParse = event.body;
-      
-      // First try to parse normally
-      let parsed = querystring.parse(bodyToParse);
-      let allKeys = Object.keys(parsed);
-      
-      console.log('Initial parsing - Keys found:', allKeys.length);
-      console.log('First key sample:', allKeys[0]?.substring(0, 100));
-      
-      // If we have only one key and it looks like Base64 encoded data
-      // Check for single key that's long and either has no value or just '='
-      if (allKeys.length === 1 && allKeys[0].length > 100 && 
-          (!parsed[allKeys[0]] || parsed[allKeys[0]] === '' || parsed[allKeys[0]] === '=')) {
-        const singleKey = allKeys[0];
-        console.log('Detected potential Base64 encoded form data');
-        
-        try {
-          // Try to decode as Base64
-          if (/^[A-Za-z0-9+/]+=*$/.test(singleKey)) {
-            const decodedBody = Buffer.from(singleKey, 'base64').toString('utf8');
-            console.log('Successfully decoded Base64 body:', decodedBody.substring(0, 200));
-            bodyToParse = decodedBody;
-            parsed = querystring.parse(bodyToParse);
-            allKeys = Object.keys(parsed);
-            console.log('After Base64 decoding - Keys found:', allKeys.length);
-          }
-        } catch (decodeError) {
-          console.log('Base64 decode failed, trying URL decode:', decodeError.message);
-          // Try URL decoding instead
-          try {
-            const urlDecoded = decodeURIComponent(singleKey);
-            parsed = querystring.parse(urlDecoded);
-            allKeys = Object.keys(parsed);
-            console.log('After URL decoding - Keys found:', allKeys.length);
-          } catch (urlError) {
-            console.log('URL decode also failed:', urlError.message);
-          }
-        }
-      }
-      
-      // If still having issues with nested encoding or Base64 wasn't detected properly
-      if (allKeys.length === 1 && 
-          (Object.values(parsed)[0] === '' || Object.values(parsed)[0] === '=') && 
-          allKeys[0].includes('=')) {
-        console.log('Detected nested form encoding, attempting to parse the key itself');
-        const onlyKey = allKeys[0];
-        try {
-          // First try to decode as Base64 if it looks like it
-          if (/^[A-Za-z0-9+/]+=*$/.test(onlyKey) && onlyKey.length > 100) {
-            console.log('Attempting Base64 decode in fallback');
-            const decodedBody = Buffer.from(onlyKey, 'base64').toString('utf8');
-            console.log('Fallback Base64 decoded content:', decodedBody.substring(0, 200));
-            form = querystring.parse(decodedBody);
-            console.log('Fallback Base64 decode successful, keys:', Object.keys(form).length);
-          } else {
-            // Try URL decoding
-            const urlDecoded = decodeURIComponent(onlyKey);
-            form = querystring.parse(urlDecoded);
-            console.log('URL decode successful, keys:', Object.keys(form).length);
-          }
-        } catch (fallbackError) {
-          console.log('Fallback parsing failed:', fallbackError.message);
-          // If all parsing fails, try to extract from the original body directly
-          try {
-            console.log('Attempting direct body parsing as last resort');
-            form = querystring.parse(event.body);
-            console.log('Direct body parsing result, keys:', Object.keys(form).length);
-          } catch (directError) {
-            console.log('Direct body parsing also failed:', directError.message);
-            form = parsed;
-          }
-        }
-      } else {
-        form = parsed;
-      }
-      
-      // For Twilio format, try to get message SID as ID
-      messageId = form?.MessageSid || form?.SmsSid || null;
-    }
-  } catch (e) {
-    console.error('Error al parsear el body:', e);
-    form = {};
-    
-    // Try one last attempt to extract basic info from raw body if everything else failed
-    if (event.body) {
-      console.log('Attempting emergency parsing from raw body...');
-      try {
-        // Try to extract basic Twilio fields with regex as last resort
-        const bodyMatch = event.body.match(/Body=([^&]+)/);
-        const fromMatch = event.body.match(/From=([^&]+)/);
-        const waidMatch = event.body.match(/WaId=([^&]+)/);
-        
-        if (bodyMatch || fromMatch || waidMatch) {
-          form = {};
-          if (bodyMatch) {
-            form.Body = decodeURIComponent(bodyMatch[1].replace(/\+/g, ' '));
-          }
-          if (fromMatch) {
-            form.From = decodeURIComponent(fromMatch[1]);
-          }
-          if (waidMatch) {
-            form.WaId = decodeURIComponent(waidMatch[1]);
-          }
-          console.log('Emergency parsing successful:', Object.keys(form));
-        }
-      } catch (emergencyError) {
-        console.log('Emergency parsing also failed:', emergencyError.message);
+      // Extract text message
+      const textMessage = extractTextMessage(form);
+      if (textMessage) {
+        mensajeUsuario = textMessage;
       }
     }
-  }
 
-  console.log('Form parseado OK:', form, 'MessageId:', messageId);
+    console.log('Final extracted message:', mensajeUsuario);
 
-  // Extract userId first for S3 storage
-  let phone = null;
-  let userId = null;
-  let phoneNumberId = PHONE_NUMBER_ID;
-  
-  if (form?.From) {
-    // Handle both WhatsApp Meta format and Twilio format
-    phone = form.From.replace(/^whatsapp:/, ""); // Remove whatsapp: prefix if present
-    const waid = form?.WaId || phone;
+    // 5. Get conversation history
+    const history = getConversationHistory(userId);
+
+    // 6. Create user message object
+    const userMessage = {
+      role: "user",
+      content: [{ type: "text", text: mensajeUsuario }],
+      messageId,
+      timestamp: new Date().toISOString()
+    };
     
-    // More robust user ID creation to maintain consistency
-    const normalizedPhone = normalizePhone(waid);
-    userId = `wa:${normalizedPhone}`;
+    history.push(userMessage);
     
-    // Log phone number extraction for debugging
-    logConversationState(userId, 'PHONE_EXTRACTED', { 
-      originalFrom: form.From, 
-      phone, 
-      waid, 
-      normalizedPhone,
-      phoneNumberId 
+    logConversationState(userId, 'USER_MESSAGE_ADDED', { 
+      messageId, 
+      messageLength: mensajeUsuario.length,
+      newHistoryLength: history.length
     });
-  } else if (form?.WaId) {
-    // Try to extract from WaId directly if From is missing
-    const waid = form.WaId;
-    const normalizedPhone = normalizePhone(waid);
-    userId = `wa:${normalizedPhone}`;
-    phone = `+${normalizedPhone}`;
-    
-    console.log('Phone extracted from WaId field:', { waid, normalizedPhone, userId });
-    logConversationState(userId, 'PHONE_EXTRACTED', { 
-      originalFrom: null, 
-      phone, 
-      waid, 
-      normalizedPhone,
-      phoneNumberId 
-    });
-  } else if (Object.keys(form).length === 1) {
-    // Try to extract phone from malformed form key
-    const singleKey = Object.keys(form)[0];
-    const fromMatch = singleKey.match(/From=whatsapp%3A%2B(\d+)/);
-    const waidMatch = singleKey.match(/WaId=(\d+)/);
-    
-    if (fromMatch) {
-      const normalizedPhone = normalizePhone(fromMatch[1]);
-      userId = `wa:${normalizedPhone}`;
-      phone = `+${normalizedPhone}`;
-      console.log('Phone extracted from malformed From field:', { normalizedPhone, userId });
-    } else if (waidMatch) {
-      const normalizedPhone = normalizePhone(waidMatch[1]);
-      userId = `wa:${normalizedPhone}`;
-      phone = `+${normalizedPhone}`;
-      console.log('Phone extracted from malformed WaId field:', { normalizedPhone, userId });
-    }
-  }
 
-  console.log('Phone:', phone, 'UserId:', userId, 'PhoneNumberId:', phoneNumberId);
-
-  // Extract message text and media from different formats
-  let mensajeUsuario = 'mensaje vacío';
-  let mediaInfo = null;
-  
-  // Check for media first (Twilio format)
-  const numMedia = parseInt(form?.NumMedia || '0');
-  const messageType = form?.MessageType;
-  
-  if (numMedia > 0 || messageType === 'audio') {
-    console.log('Detected media message - NumMedia:', numMedia, 'MessageType:', messageType);
-    
-    // Extract media information
-    const medias = [];
-    for (let i = 0; i < Math.max(numMedia, 1); i++) {
-      const mediaUrl = form[`MediaUrl${i}`];
-      const mediaContentType = form[`MediaContentType${i}`];
-      if (mediaUrl) {
-        medias.push({
-          url: mediaUrl,
-          contentType: mediaContentType
-        });
-        console.log(`Media ${i} found:`, { url: mediaUrl, contentType: mediaContentType });
-      }
-    }
-    
-    if (medias.length > 0) {
-      mediaInfo = { medias };
-      
-      // Process audio immediately if detected
-      if (messageType === 'audio' || medias.some(m => m.contentType?.includes('audio'))) {
-        console.log('Audio message detected, processing transcription...');
-        
-        try {
-          // Find the audio media
-          const audioMedia = medias.find(m => isAudioFile(m.contentType));
-          if (audioMedia) {
-            console.log(`[AUDIO] Processing audio: ${audioMedia.url} (${audioMedia.contentType})`);
-            
-            // Download audio from Twilio
-            const audioBuffer = await downloadTwilioMedia(audioMedia.url);
-            
-            // Determine file extension
-            const audioExtension = audioMedia.contentType.split('/')[1] || 'ogg';
-            
-            // Use the extracted userId for S3 path, fallback to temp if not available
-            const s3UserId = userId || ('temp_' + Date.now());
-            
-            // Upload to S3
-            const s3AudioFile = await putMediaToS3(audioBuffer, audioMedia.contentType, s3UserId, audioExtension);
-            
-            // Transcribe the audio
-            const transcribedText = await transcribeAudio(s3AudioFile.url, audioExtension);
-            
-            if (transcribedText && transcribedText.trim()) {
-              mensajeUsuario = transcribedText.trim();
-              console.log(`[AUDIO] Successfully transcribed: "${mensajeUsuario}"`);
-            } else {
-              mensajeUsuario = 'He recibido tu mensaje de audio pero no pude entender lo que dijiste. ¿Podrías escribirme o enviar el audio de nuevo?';
-              console.log('[AUDIO] Transcription failed or empty');
-            }
-          } else {
-            console.log('[AUDIO] No audio file found in media');
-            mensajeUsuario = 'He recibido un archivo multimedia pero no pude procesarlo como audio.';
-          }
-        } catch (error) {
-          console.error('[AUDIO] Error processing audio:', error);
-          mensajeUsuario = 'He recibido tu mensaje de audio pero hubo un error al procesarlo. ¿Podrías escribirme o intentar de nuevo?';
-        }
-      }
-    }
-  }
-  
-  // Extract text message if no audio or if Body has content
-  if (form?.Body?.trim?.() && mensajeUsuario === 'mensaje vacío') {
-    // Twilio format
-    mensajeUsuario = form.Body.trim();
-    console.log('Message extracted from Twilio Body field:', mensajeUsuario);
-  } else if (form?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.text?.body) {
-    // Meta WhatsApp webhook format
-    mensajeUsuario = form.entry[0].changes[0].value.messages[0].text.body.trim();
-    console.log('Message extracted from Meta webhook format:', mensajeUsuario);
-  } else if (mensajeUsuario === 'mensaje vacío') {
-    // Try to find any field that might contain the message
-    console.log('Standard extraction failed, trying fallback methods...');
-    console.log('Form keys available:', Object.keys(form));
-    
-    // Look for common Twilio fields that might contain the message
-    const possibleMessageFields = ['Body', 'body', 'Text', 'text', 'Message', 'message'];
-    for (const field of possibleMessageFields) {
-      if (form[field] && typeof form[field] === 'string' && form[field].trim()) {
-        mensajeUsuario = form[field].trim();
-        console.log(`Message found in field '${field}':`, mensajeUsuario);
-        break;
-      }
-    }
-    
-    // If still empty and we have only one form key that might be malformed data, try to extract from it
-    if (mensajeUsuario === 'mensaje vacío' && Object.keys(form).length === 1) {
-      const singleKey = Object.keys(form)[0];
-      const singleValue = Object.values(form)[0];
-      
-      // Try to extract Body parameter from the key itself (in case parsing failed)
-      const bodyMatch = singleKey.match(/Body=([^&]+)/);
-      if (bodyMatch) {
-        try {
-          mensajeUsuario = decodeURIComponent(bodyMatch[1].replace(/\+/g, ' ')).trim();
-          console.log('Message extracted from malformed form key:', mensajeUsuario);
-        } catch (e) {
-          console.log('Failed to decode message from form key:', e.message);
-        }
-      }
-    }
-    
-    // If still empty, log the form structure for debugging
-    if (mensajeUsuario === 'mensaje vacío') {
-      console.log('No message found in any field. Full form structure:', JSON.stringify(form, null, 2));
-    }
-  }
-  
-  console.log('Final extracted message:', mensajeUsuario);
-  
-  // Ensure we have userId, fallback to anon if extraction failed
-  if (!userId) {
-    userId = 'anon';
-  }
-  
-  // Handle Meta WhatsApp webhook format if not already processed
-  if (!userId || userId === 'anon') {
-    if (form?.entry?.[0]?.changes?.[0]?.value) {
-      // Handle Meta WhatsApp webhook format
-      const value = form.entry[0].changes[0].value;
-      const contact = value.contacts?.[0];
-      const message = value.messages?.[0];
-    
-    if (contact?.wa_id || message?.from) {
-      const waid = contact?.wa_id || message?.from;
-      phone = waid;
-      const normalizedPhone = normalizePhone(waid);
-      userId = `wa:${normalizedPhone}`;
-      
-      // Extract phone_number_id from webhook if available
-      phoneNumberId = value.metadata?.phone_number_id || PHONE_NUMBER_ID;
-      
-      logConversationState(userId, 'META_WEBHOOK_PHONE_EXTRACTED', { 
-        waid, 
-        phone, 
-        normalizedPhone,
-        phoneNumberId,
-        metadataPhoneId: value.metadata?.phone_number_id
-      });
-      }
-    }
-  }
-  
-  // Fallback phone extraction if main parsing failed
-  if (userId === 'anon' && event.body) {
-    console.log('Main phone extraction failed, trying fallback methods...');
-    
-    // Try to extract phone from raw body using regex
-    const phonePatterns = [
-      /From=whatsapp%3A%2B(\d+)/,
-      /From=whatsapp:(\+\d+)/,
-      /WaId=(\d+)/,
-      /"from":"(\d+)"/,
-      /"wa_id":"(\d+)"/
-    ];
-    
-    for (const pattern of phonePatterns) {
-      const match = event.body.match(pattern);
-      if (match) {
-        const extractedPhone = match[1].replace(/^\+/, '');
-        const normalizedPhone = normalizePhone(extractedPhone);
-        userId = `wa:${normalizedPhone}`;
-        phone = extractedPhone;
-        console.log('Fallback phone extraction successful:', { extractedPhone, normalizedPhone, userId });
-        break;
-      }
-    }
-    
-    // If still anonymous, try to find existing conversations with recent activity
-    if (userId === 'anon') {
-      console.log('Phone extraction failed completely, checking for recent conversations...');
-      const recentUsers = Object.keys(memory)
-        .filter(key => key.startsWith('wa:') && memory[key] && memory[key].length > 0)
-        .sort((a, b) => {
-          const aLastMsg = memory[a][memory[a].length - 1];
-          const bLastMsg = memory[b][memory[b].length - 1];
-          const aTime = aLastMsg?.metadata?.timestamp || 0;
-          const bTime = bLastMsg?.metadata?.timestamp || 0;
-          return new Date(bTime) - new Date(aTime);
-        });
-      
-      if (recentUsers.length > 0) {
-        console.log('Found recent conversations, using most recent:', recentUsers[0]);
-        userId = recentUsers[0];
-        // Extract phone from userId for consistency
-        phone = userId.replace('wa:', '');
-      }
-    }
-  }
-  
-  console.log('Phone:', phone, 'UserId:', userId, 'PhoneNumberId:', phoneNumberId);
-
-  // Obtener historial previo o crear nuevo con fallback a backup
-  let history = memory[userId];
-  
-  if (!history || history.length === 0) {
-    // Try to restore from backup if main history is lost
-    history = restoreConversation(userId);
-    if (history.length > 0) {
-      memory[userId] = history; // Restore to main memory
-    }
-  }
-  
-  if (!history) {
-    history = [];
-  }
-  
-  // Log conversation state for debugging
-  logConversationState(userId, 'HISTORY_RETRIEVED', { 
-    historyLength: history.length,
-    messageId,
-    hasExistingConversation: history.length > 0,
-    phoneNumberId
-  });
-
-  // Check for duplicate messages using messageId
-  if (messageId) {
-    const recentMessages = history.slice(-10); // Check last 10 messages
-    const isDuplicate = recentMessages.some(msg => 
-      msg.role === "user" && 
-      msg.content?.[0]?.text === mensajeUsuario &&
-      msg.messageId === messageId
-    );
-    
-    if (isDuplicate) {
-      logConversationState(userId, 'DUPLICATE_MESSAGE_DETECTED', { messageId, mensajeUsuario });
-      console.log(`[DEBUG] Mensaje duplicado detectado: ${messageId}`);
-      return {
-        statusCode: 200,
-        headers: { "Content-Type": "application/xml" },
-        body: `<Response></Response>` // Empty response for duplicates
-      };
-    }
-  }
-
-  // Agregar el nuevo mensaje del usuario con messageId y phone info
-  const userMessage = {
-    role: "user",
-    content: [{ type: "text", text: mensajeUsuario }],
-    ...(messageId && { messageId }),
-    // Add metadata to help maintain conversation thread
-    metadata: {
+    // 7. Prepare payload for backend
+    const payload = {
+      input: { type: "text", text: mensajeUsuario },
+      history,
       phone,
       userId,
       phoneNumberId,
-      timestamp: new Date().toISOString()
-    }
-  };
-  
-  history.push(userMessage);
-  
-  logConversationState(userId, 'USER_MESSAGE_ADDED', { 
-    messageId, 
-    messageLength: mensajeUsuario.length,
-    newHistoryLength: history.length
-  });
+      ...(mediaInfo && { mediaInfo })
+    };
 
-  const payload = {
-    input: { type: "text", text: mensajeUsuario },
-    history,
-    // Pass phone info to maintain consistency
-    phone,
-    userId,
-    phoneNumberId,
-    // Pass media information for audio processing
-    ...(mediaInfo && { mediaInfo })
-  };
-
-  try {
+    // 8. Call backend API
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 15000);
 
@@ -676,10 +718,9 @@ export const handler = async (event) => {
     const response = await fetchResponse.json();
     console.log('Respuesta backend:', response);
 
-    // Preparar mensaje para WhatsApp
+    // 9. Process response and update history
     let mensaje = 'Sin respuesta IA';
     if (Array.isArray(response.reply) && response.reply.length > 0) {
-      // Concatenar todos los mensajes de texto de la respuesta
       const mensajes = response.reply
         .filter(item => item?.type === 'text' && item?.text)
         .map(item => item.text);
@@ -687,25 +728,20 @@ export const handler = async (event) => {
       if (mensajes.length > 0) {
         mensaje = mensajes.join('\n\n');
 
-        // Agregar respuesta completa al historial con metadata
+        // Add complete response to history
         const assistantMessage = {
           role: "assistant",
           content: response.reply,
-          metadata: {
-            phone,
-            userId,
-            phoneNumberId,
-            timestamp: new Date().toISOString()
-          }
+          timestamp: new Date().toISOString()
         };
         
         history.push(assistantMessage);
-
-        // Guardar historial actualizado
-        memory[userId] = history;
         
-        // Create backup of conversation to prevent loss
+        // Backup conversation
         backupConversation(userId, history);
+        
+        // Update memory
+        memory[userId] = history;
         
         logConversationState(userId, 'ASSISTANT_RESPONSE_ADDED', { 
           responseLength: mensaje.length,
@@ -715,24 +751,29 @@ export const handler = async (event) => {
       }
     }
 
+    // 10. Return response
     return {
       statusCode: 200,
-      headers: { "Content-Type": "application/xml" },
-      body: `<Response><Message>${mensaje}</Message></Response>`
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ 
+        status: "success", 
+        message: "Mensaje procesado correctamente",
+        response: mensaje,
+        userId,
+        messageId
+      })
     };
 
-  } catch (err) {
-    console.error('Error en handler:', err);
-
-    let mensajeError = 'Error procesando tu mensaje.';
-    if (err.name === 'AbortError') {
-      mensajeError = 'Lo siento, el servicio está tardando mucho en responder. Intentá más tarde.';
-    }
-
+  } catch (error) {
+    console.error('Error in handler:', error);
     return {
-      statusCode: 200,
-      headers: { "Content-Type": "application/xml" },
-      body: `<Response><Message>${mensajeError}</Message></Response>`
+      statusCode: 500,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ 
+        status: "error", 
+        message: "Error interno del servidor",
+        error: error.message
+      })
     };
   }
 };
