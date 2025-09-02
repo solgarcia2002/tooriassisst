@@ -12,10 +12,12 @@ const normalizePhone = (s) => (s || "").replace(/\D/g, "");
 
 // Get environment variables
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const REGION = process.env.AWS_REGION || "us-west-2";
 const MEDIA_BUCKET = process.env.MEDIA_BUCKET || "toori360";
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM;
 
 // Initialize AWS clients
 const s3 = new S3Client({ region: REGION });
@@ -555,6 +557,152 @@ const extractTextMessage = (form) => {
 };
 
 // ==========================================
+// WHATSAPP MESSAGING METHODS
+// ==========================================
+
+/**
+ * Divide response into smaller messages for WhatsApp
+ */
+const dividirRespuesta = (texto) => {
+  // First, split by double newlines (paragraph breaks)
+  const paragraphs = texto.split(/\n\n+/);
+  const messages = [];
+  
+  for (const paragraph of paragraphs) {
+    const trimmed = paragraph.trim();
+    if (!trimmed) continue;
+    
+    // If paragraph is short enough, send as one message
+    if (trimmed.length <= 300) {
+      messages.push(trimmed);
+    } else {
+      // Split longer paragraphs by sentences, but keep them reasonable length
+      const sentences = trimmed.split(/(?<=\.)\s+/);
+      let currentMessage = "";
+      
+      for (const sentence of sentences) {
+        if (currentMessage.length + sentence.length <= 300) {
+          currentMessage += (currentMessage ? " " : "") + sentence;
+        } else {
+          if (currentMessage) messages.push(currentMessage);
+          currentMessage = sentence;
+        }
+      }
+      if (currentMessage) messages.push(currentMessage);
+    }
+  }
+  
+  return messages.length > 0 ? messages : [texto.trim()];
+};
+
+/**
+ * Wait function for message delays
+ */
+const esperar = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Send message via Meta WhatsApp API
+ */
+const sendWhatsAppMessage = async (phone, message) => {
+  if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID) {
+    console.error('[WHATSAPP] Missing WhatsApp credentials');
+    return false;
+  }
+
+  try {
+    const response = await fetch(`https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`, {
+      method: "POST",
+      headers: { 
+        "Authorization": `Bearer ${WHATSAPP_TOKEN}`, 
+        "Content-Type": "application/json" 
+      },
+      body: JSON.stringify({ 
+        messaging_product: "whatsapp", 
+        to: phone, 
+        type: "text", 
+        text: { body: message } 
+      })
+    });
+
+    if (!response.ok) {
+      console.error('[WHATSAPP] Send failed:', response.status, await response.text());
+      return false;
+    }
+
+    console.log(`[WHATSAPP] Message sent to ${phone}: "${message.substring(0, 50)}..."`);
+    return true;
+  } catch (error) {
+    console.error('[WHATSAPP] Send error:', error);
+    return false;
+  }
+};
+
+/**
+ * Send message via Twilio WhatsApp API
+ */
+const sendTwilioMessage = async (phone, message) => {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_WHATSAPP_FROM) {
+    console.error('[TWILIO] Missing Twilio credentials');
+    return false;
+  }
+
+  try {
+    const form = new URLSearchParams();
+    form.set("To", `whatsapp:${phone}`);
+    form.set("From", TWILIO_WHATSAPP_FROM);
+    form.set("Body", message);
+
+    const response = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`, {
+      method: "POST",
+      headers: { 
+        Authorization: getTwilioAuthHeader(), 
+        "Content-Type": "application/x-www-form-urlencoded" 
+      },
+      body: form
+    });
+
+    if (!response.ok) {
+      console.error('[TWILIO] Send failed:', response.status, await response.text());
+      return false;
+    }
+
+    console.log(`[TWILIO] Message sent to ${phone}: "${message.substring(0, 50)}..."`);
+    return true;
+  } catch (error) {
+    console.error('[TWILIO] Send error:', error);
+    return false;
+  }
+};
+
+/**
+ * Send messages to WhatsApp user
+ */
+const sendMessagesToWhatsApp = async (phone, messages, isTwilio = false) => {
+  console.log(`[MESSAGING] Sending ${messages.length} messages to ${phone} via ${isTwilio ? 'Twilio' : 'Meta'}`);
+  
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    let success = false;
+    
+    if (isTwilio) {
+      success = await sendTwilioMessage(phone, message);
+    } else {
+      success = await sendWhatsAppMessage(phone, message);
+    }
+    
+    if (!success) {
+      console.error(`[MESSAGING] Failed to send message ${i + 1}/${messages.length}`);
+      // Continue with other messages even if one fails
+    }
+    
+    // Add delay between messages to avoid rate limiting
+    if (i < messages.length - 1) {
+      await esperar(800);
+    }
+  }
+};
+
+// ==========================================
 // CONVERSATION MANAGEMENT METHODS
 // ==========================================
 
@@ -650,6 +798,12 @@ export const handler = async (event) => {
 
     // 2. Extract user information
     const { phone, userId, phoneNumberId } = extractUserInfo(form);
+    
+    // 2.5. Determine message source type for later use
+    const isTwilioMessage = form?.From?.includes('whatsapp:') || !!form?.WaId || !!form?.MessageSid;
+    const isMetaMessage = !!form?.entry?.[0]?.changes?.[0]?.value?.messages;
+    
+    console.log(`[MESSAGE_TYPE] Twilio: ${isTwilioMessage}, Meta: ${isMetaMessage}`);
 
     // 3. Extract media information
     const mediaInfo = extractMediaInfo(form);
@@ -715,11 +869,30 @@ export const handler = async (event) => {
 
     clearTimeout(timeoutId);
 
+    if (!fetchResponse.ok) {
+      console.error('[BACKEND] Backend responded with error:', fetchResponse.status, fetchResponse.statusText);
+      throw new Error(`Backend error: ${fetchResponse.status} ${fetchResponse.statusText}`);
+    }
+
     const response = await fetchResponse.json();
     console.log('Respuesta backend:', response);
 
+    // Check if backend response is valid
+    if (!response || (!response.reply && !response.error)) {
+      console.error('[BACKEND] Invalid response format:', response);
+      throw new Error('Backend returned invalid response format');
+    }
+
+    // Handle backend errors
+    if (response.error) {
+      console.error('[BACKEND] Backend returned error:', response.error);
+      throw new Error(`Backend error: ${response.error}`);
+    }
+
     // 9. Process response and update history
     let mensaje = 'Sin respuesta IA';
+    let mensajesParaEnviar = [];
+    
     if (Array.isArray(response.reply) && response.reply.length > 0) {
       const mensajes = response.reply
         .filter(item => item?.type === 'text' && item?.text)
@@ -727,6 +900,9 @@ export const handler = async (event) => {
       
       if (mensajes.length > 0) {
         mensaje = mensajes.join('\n\n');
+        
+        // Divide the response into WhatsApp-friendly messages
+        mensajesParaEnviar = dividirRespuesta(mensaje);
 
         // Add complete response to history
         const assistantMessage = {
@@ -748,17 +924,40 @@ export const handler = async (event) => {
           finalHistoryLength: history.length,
           phoneNumberId
         });
+      } else {
+        // No valid text messages in response
+        console.warn('[BACKEND] No valid text messages in response.reply');
+        mensajesParaEnviar = ["Disculpa, no pude generar una respuesta adecuada. ¿Podrías reformular tu pregunta?"];
       }
+    } else {
+      // No reply array or empty reply
+      console.warn('[BACKEND] No reply array in response or reply is empty');
+      mensajesParaEnviar = ["Disculpa, no pude procesar tu mensaje correctamente. ¿Podrías intentar de nuevo?"];
     }
 
-    // 10. Return response
+    // 10. Send messages back to WhatsApp
+    if (phone && mensajesParaEnviar.length > 0) {
+      console.log(`[MESSAGING] Sending response to ${phone} (${mensajesParaEnviar.length} messages) via ${isTwilioMessage ? 'Twilio' : 'Meta'}`);
+      
+      try {
+        await sendMessagesToWhatsApp(phone, mensajesParaEnviar, isTwilioMessage);
+        console.log('[MESSAGING] All messages sent successfully');
+      } catch (error) {
+        console.error('[MESSAGING] Error sending messages:', error);
+      }
+    } else {
+      console.warn('[MESSAGING] No phone number or messages to send:', { phone, messagesCount: mensajesParaEnviar.length });
+    }
+
+    // 11. Return response
     return {
       statusCode: 200,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ 
         status: "success", 
-        message: "Mensaje procesado correctamente",
+        message: "Mensaje procesado y enviado correctamente",
         response: mensaje,
+        messagesSent: mensajesParaEnviar.length,
         userId,
         messageId
       })
@@ -766,6 +965,20 @@ export const handler = async (event) => {
 
   } catch (error) {
     console.error('Error in handler:', error);
+    
+    // Try to send error message to user if we have their phone number
+    if (phone) {
+      const errorMessage = "Disculpa, tuve un problema técnico. ¿Podrías intentar de nuevo en unos momentos?";
+      const isTwilio = form?.From?.includes('whatsapp:') || !!form?.WaId || !!form?.MessageSid;
+      
+      try {
+        await sendMessagesToWhatsApp(phone, [errorMessage], isTwilio);
+        console.log('[ERROR_RECOVERY] Error message sent to user');
+      } catch (sendError) {
+        console.error('[ERROR_RECOVERY] Failed to send error message:', sendError);
+      }
+    }
+    
     return {
       statusCode: 500,
       headers: { "Content-Type": "application/json" },
