@@ -526,14 +526,33 @@ export const handler = async (event) => {
     // Handle empty messages more intelligently
     if (!inputText || inputText === 'mensaje vacío') {
       // Check if this is a repeated empty message
-      const recentMessages = history.slice(-6); // Check last 6 messages
+      const recentMessages = history.slice(-10); // Check last 10 messages for better context
       const recentEmptyMessages = recentMessages.filter(m => 
         m.role === "user" && (m.content?.[0]?.text === "mensaje vacío" || !m.content?.[0]?.text?.trim())
       );
       
-      // Check if we have any context about gas problems from recent conversation
+      // Check for various types of context from recent conversation
       const hasGasContext = recentMessages.some(m => 
         m.role === "user" && m.content?.[0]?.text?.toLowerCase().includes('gas')
+      );
+      
+      const hasElectricalContext = recentMessages.some(m => 
+        m.role === "user" && (m.content?.[0]?.text?.toLowerCase().includes('enchufe') || 
+                              m.content?.[0]?.text?.toLowerCase().includes('electricidad') ||
+                              m.content?.[0]?.text?.toLowerCase().includes('heladera'))
+      );
+      
+      const hasPlumbingContext = recentMessages.some(m => 
+        m.role === "user" && (m.content?.[0]?.text?.toLowerCase().includes('agua') ||
+                              m.content?.[0]?.text?.toLowerCase().includes('canilla') ||
+                              m.content?.[0]?.text?.toLowerCase().includes('pérdida'))
+      );
+      
+      // Check if user provided name and address recently
+      const hasUserInfo = recentMessages.some(m => 
+        m.role === "user" && (m.content?.[0]?.text?.toLowerCase().includes('rivadavia') ||
+                              m.content?.[0]?.text?.toLowerCase().includes('sol') ||
+                              m.content?.[0]?.text?.toLowerCase().includes('inqui'))
       );
       
       if (recentEmptyMessages.length >= 3) {
@@ -542,14 +561,26 @@ export const handler = async (event) => {
       } else if (recentEmptyMessages.length >= 2 && hasGasContext) {
         // Multiple empty messages but we know it's about gas - might be an emergency
         inputText = "sigo teniendo el problema de gas que mencioné antes";
+      } else if (recentEmptyMessages.length >= 2 && hasElectricalContext) {
+        // Multiple empty messages with electrical context
+        inputText = "sigo con el problema del enchufe de la heladera que te comenté";
+      } else if (recentEmptyMessages.length >= 2 && hasPlumbingContext) {
+        // Multiple empty messages with plumbing context
+        inputText = "sigo con el problema de agua que te mencioné";
+      } else if (recentEmptyMessages.length >= 2 && hasUserInfo) {
+        // User has context but multiple empty messages
+        inputText = "necesito ayuda con el problema que te estaba contando";
       } else if (recentEmptyMessages.length >= 2) {
         // User sent multiple empty messages, ask for clarification
         inputText = "necesito ayuda pero no sé cómo explicar mi problema";
+      } else if (imagenesS3.length === 0 && history.length === 0) {
+        // First message and it's empty - treat as greeting
+        inputText = "hola";
       } else if (imagenesS3.length === 0) {
         inputText = "mensaje vacío";
       }
       
-      console.log(`[DEBUG] Mensaje vacío procesado para userId: ${userId}, recientes: ${recentEmptyMessages.length}, contexto gas: ${hasGasContext}`);
+      console.log(`[DEBUG] Mensaje vacío procesado para userId: ${userId}, recientes: ${recentEmptyMessages.length}, contextos: gas=${hasGasContext}, electrical=${hasElectricalContext}, plumbing=${hasPlumbingContext}, userInfo=${hasUserInfo}`);
     }
 
     console.log(`[DEBUG] InputText: "${inputText}", UserId: ${userId}, HistoryLength: ${history.length}`);
