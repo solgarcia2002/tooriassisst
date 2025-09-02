@@ -19,6 +19,127 @@ const transcribe = new TranscribeClient({ region: REGION });
 
 const memory = {}; // Historial temporal por usuario
 
+// Twilio authentication
+const twilioBasicAuth = () =>
+  "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+
+// Download media from Twilio
+const downloadTwilioMedia = async (mediaUrl) => {
+  console.log(`[AUDIO] Descargando audio desde Twilio: ${mediaUrl}`);
+  const response = await fetch(mediaUrl, { 
+    headers: { Authorization: twilioBasicAuth() } 
+  });
+  if (!response.ok) {
+    throw new Error(`Error descargando audio de Twilio: ${response.status}`);
+  }
+  const arrayBuffer = await response.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+};
+
+// Upload media to S3
+const putMediaToS3 = async (buffer, contentType, userId, extension) => {
+  const fileName = `media/${userId}/${crypto.randomUUID()}.${extension}`;
+  const key = fileName;
+  
+  console.log(`[AUDIO] Subiendo audio a S3: ${key}`);
+  
+  await s3.send(new PutObjectCommand({
+    Bucket: MEDIA_BUCKET,
+    Key: key,
+    Body: buffer,
+    ContentType: contentType,
+    Metadata: { userId }
+  }));
+  
+  const url = `https://${MEDIA_BUCKET}.s3.${REGION}.amazonaws.com/${key}`;
+  console.log(`[AUDIO] Audio subido a S3: ${url}`);
+  
+  return {
+    url,
+    key,
+    contentType,
+    size: buffer.length
+  };
+};
+
+// Transcribe audio using Amazon Transcribe
+const transcribeAudio = async (audioS3Url, audioFormat = 'ogg') => {
+  try {
+    console.log(`[TRANSCRIBE] Iniciando transcripción de: ${audioS3Url}`);
+    
+    const jobName = `transcribe-job-${crypto.randomUUID()}`;
+    const mediaFormat = audioFormat === 'ogg' ? 'ogg' : audioFormat.toLowerCase();
+    
+    // Start transcription job
+    const startJobCommand = new StartTranscriptionJobCommand({
+      TranscriptionJobName: jobName,
+      LanguageCode: 'es-ES', // Spanish for Argentina
+      MediaFormat: mediaFormat,
+      Media: {
+        MediaFileUri: audioS3Url
+      },
+      Settings: {
+        ShowSpeakerLabels: false,
+        MaxSpeakerLabels: 1
+      }
+    });
+    
+    await transcribe.send(startJobCommand);
+    console.log(`[TRANSCRIBE] Trabajo iniciado: ${jobName}`);
+    
+    // Wait for transcription to complete
+    let jobStatus = 'IN_PROGRESS';
+    let attempts = 0;
+    const maxAttempts = 30; // 30 attempts * 2 seconds = 60 seconds max
+    
+    while (jobStatus === 'IN_PROGRESS' && attempts < maxAttempts) {
+      await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
+      attempts++;
+      
+      const getJobCommand = new GetTranscriptionJobCommand({
+        TranscriptionJobName: jobName
+      });
+      
+      const result = await transcribe.send(getJobCommand);
+      jobStatus = result.TranscriptionJob.TranscriptionJobStatus;
+      
+      console.log(`[TRANSCRIBE] Estado del trabajo (${attempts}/${maxAttempts}): ${jobStatus}`);
+      
+      if (jobStatus === 'COMPLETED') {
+        const transcriptUri = result.TranscriptionJob.Transcript.TranscriptFileUri;
+        console.log(`[TRANSCRIBE] Descargando transcript desde: ${transcriptUri}`);
+        
+        const transcriptResponse = await fetch(transcriptUri);
+        const transcriptData = await transcriptResponse.json();
+        
+        const transcribedText = transcriptData.results.transcripts[0]?.transcript || '';
+        console.log(`[TRANSCRIBE] Texto transcrito: "${transcribedText}"`);
+        
+        return transcribedText;
+      } else if (jobStatus === 'FAILED') {
+        console.error(`[TRANSCRIBE] Trabajo falló: ${result.TranscriptionJob.FailureReason}`);
+        return null;
+      }
+    }
+    
+    if (jobStatus === 'IN_PROGRESS') {
+      console.error('[TRANSCRIBE] Timeout: El trabajo de transcripción tomó demasiado tiempo');
+      return null;
+    }
+    
+  } catch (error) {
+    console.error('[TRANSCRIBE] Error en transcripción:', error);
+    return null;
+  }
+};
+
+// Check if content type is audio
+const isAudioFile = (contentType) => {
+  if (!contentType) return false;
+  const audioTypes = ['audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/webm', 'audio/aac'];
+  return audioTypes.some(type => contentType.toLowerCase().includes(type.split('/')[1]));
+};
+
 // Enhanced logging for debugging conversation threads
 const logConversationState = (userId, action, details = {}) => {
   console.log(`[CONVERSATION_THREAD] ${action} - UserId: ${userId}`, details);
