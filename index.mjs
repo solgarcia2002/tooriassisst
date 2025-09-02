@@ -229,10 +229,13 @@ export const handler = async (event) => {
       history = await loadHistory(userId);
     }
 
-    // si no hay texto ni media -> no hacemos nada (evita "mensaje vacío")
+    // si no hay texto ni media -> registrar como mensaje vacío pero continuar conversación
     if (!inputText && imagenesS3.length === 0) {
-      return { statusCode: 200, body: JSON.stringify({ status: "NO_INPUT" }) };
+      inputText = "mensaje vacío"; // registrar en historial para debug
+      console.log(`[DEBUG] Mensaje vacío detectado para userId: ${userId}`);
     }
+    
+    console.log(`[DEBUG] InputText: "${inputText}", UserId: ${userId}, HistoryLength: ${history.length}`);
 
     // ===== Prompt del sistema =====
     const systemPrompt = {
@@ -316,6 +319,8 @@ Secuencia obligatoria:
 
     const salidaSinJson = salidaIA.replace(/\[RESUMEN_JSON\][\s\S]*?\[\/RESUMEN_JSON\]/g, "").trim();
     const mensajes = dividirRespuesta(salidaSinJson);
+    
+    console.log(`[DEBUG] Mensajes a enviar (${mensajes.length}):`, mensajes);
 
     // ===== Enviar resumen si está completo =====
     if (resumen) {
@@ -335,8 +340,11 @@ Secuencia obligatoria:
     }
 
     // ===== Persistir historial =====
-    const assistantReply = mensajes.map(text => ({ type: "text", text }));
-    const newHistory = [...updatedMessages, { role: "assistant", content: assistantReply }];
+    // Guardar cada mensaje del asistente por separado para mantener el flujo conversacional
+    let newHistory = [...updatedMessages];
+    for (const mensaje of mensajes) {
+      newHistory.push({ role: "assistant", content: [{ type: "text", text: mensaje }] });
+    }
     try { await saveHistory(userId, newHistory); } catch (e) { console.error("S3 save err:", e?.message || e); }
 
     // ===== Responder por WhatsApp =====
@@ -370,6 +378,7 @@ Secuencia obligatoria:
     }
 
     // Web/API
+    const assistantReply = mensajes.map(text => ({ type: "text", text }));
     return { statusCode: 200, body: JSON.stringify({ reply: assistantReply, history: newHistory }) };
 
   } catch (err) {
