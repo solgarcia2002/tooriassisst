@@ -1,6 +1,7 @@
 // index.mjs
 import { BedrockRuntimeClient, InvokeModelCommand } from "@aws-sdk/client-bedrock-runtime";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { TranscribeClient, StartTranscriptionJobCommand, GetTranscriptionJobCommand } from "@aws-sdk/client-transcribe";
 import { Readable } from "stream";
 import crypto from "crypto";
 
@@ -20,12 +21,15 @@ const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM;
 
 const s3 = new S3Client({ region: REGION });
 const bedrock = new BedrockRuntimeClient({ region: REGION });
+const transcribe = new TranscribeClient({ region: REGION });
 
 const SYSTEM_TEXT = `Actuás como un asistente virtual joven, experto en ayudar a inquilinos con problemas en casa.
 Respondés en estilo conversacional argentino, breve y directo, como en un chat real.
 Usá modismos suaves y abreviaciones comunes (tipo "x", "tmb", "info", "urgente", etc).
 
 IMPORTANTE: Revisá siempre el historial de la conversación para no repetir preguntas ya hechas o información ya dada.
+
+📱 MENSAJES DE AUDIO: Cuando el usuario envía un mensaje de audio que fue transcrito automáticamente, el texto puede tener pequeños errores de transcripción. Interpretá el mensaje con contexto y sentido común. Si no entendés algo por errores de transcripción, pedí aclaración de forma amigable.
 
 🚨 EMERGENCIAS DE GAS: Si detectás olor a gas o problemas con gas, respondé INMEDIATAMENTE con medidas de seguridad (ventilar, no encender luces, salir del lugar, llamar bomberos). Es PRIORIDAD ABSOLUTA.
 
@@ -201,6 +205,85 @@ const downloadTwilioMedia = async (mediaUrl) => {
 
 const normalizePhone = (s) => (s || "").replace(/\D/g, "");
 
+// Función para transcribir audio usando Amazon Transcribe
+const transcribeAudio = async (audioS3Url, audioFormat = 'ogg') => {
+  try {
+    console.log(`[TRANSCRIBE] Iniciando transcripción de: ${audioS3Url}`);
+    
+    const jobName = `transcribe-job-${crypto.randomUUID()}`;
+    const mediaFormat = audioFormat === 'ogg' ? 'ogg' : audioFormat.toLowerCase();
+    
+    // Iniciar trabajo de transcripción
+    const startJobCommand = new StartTranscriptionJobCommand({
+      TranscriptionJobName: jobName,
+      LanguageCode: 'es-ES', // Español para Argentina
+      MediaFormat: mediaFormat,
+      Media: {
+        MediaFileUri: audioS3Url
+      },
+      Settings: {
+        ShowSpeakerLabels: false,
+        MaxSpeakerLabels: 1
+      }
+    });
+    
+    await transcribe.send(startJobCommand);
+    console.log(`[TRANSCRIBE] Trabajo iniciado: ${jobName}`);
+    
+    // Esperar a que termine la transcripción
+    let jobStatus = 'IN_PROGRESS';
+    let attempts = 0;
+    const maxAttempts = 30; // 30 intentos = ~30 segundos máximo
+    
+    while (jobStatus === 'IN_PROGRESS' && attempts < maxAttempts) {
+      await esperar(1000); // Esperar 1 segundo
+      attempts++;
+      
+      const getJobCommand = new GetTranscriptionJobCommand({
+        TranscriptionJobName: jobName
+      });
+      
+      const result = await transcribe.send(getJobCommand);
+      jobStatus = result.TranscriptionJob.TranscriptionJobStatus;
+      
+      console.log(`[TRANSCRIBE] Estado del trabajo (${attempts}/${maxAttempts}): ${jobStatus}`);
+      
+      if (jobStatus === 'COMPLETED') {
+        const transcriptUri = result.TranscriptionJob.Transcript.TranscriptFileUri;
+        console.log(`[TRANSCRIBE] Transcripción completada: ${transcriptUri}`);
+        
+        // Descargar y parsear el resultado
+        const transcriptResponse = await fetch(transcriptUri);
+        const transcriptData = await transcriptResponse.json();
+        
+        const transcribedText = transcriptData.results.transcripts[0]?.transcript || '';
+        console.log(`[TRANSCRIBE] Texto transcrito: "${transcribedText}"`);
+        
+        return transcribedText;
+      } else if (jobStatus === 'FAILED') {
+        console.error(`[TRANSCRIBE] Trabajo falló: ${result.TranscriptionJob.FailureReason}`);
+        return null;
+      }
+    }
+    
+    if (attempts >= maxAttempts) {
+      console.error('[TRANSCRIBE] Timeout esperando transcripción');
+      return null;
+    }
+    
+  } catch (error) {
+    console.error('[TRANSCRIBE] Error en transcripción:', error);
+    return null;
+  }
+};
+
+// Función para determinar si un archivo es de audio
+const isAudioFile = (contentType) => {
+  if (!contentType) return false;
+  const audioTypes = ['audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/webm', 'audio/aac'];
+  return audioTypes.some(type => contentType.toLowerCase().includes(type.split('/')[1]));
+};
+
 export const handler = async (event) => {
   let isWhatsApp = false;
   let isTwilio = false;
@@ -346,7 +429,25 @@ export const handler = async (event) => {
         }
       }
       
-      try { imagenesS3 = await saveWhatsAppMediaIfAny(metaMsg, userId); } catch (e) { console.warn("Meta media:", e?.message); }
+      try { 
+        imagenesS3 = await saveWhatsAppMediaIfAny(metaMsg, userId);
+        
+        // Procesar audio para transcripción si existe
+        if (metaMsg?.audio?.id && imagenesS3.length > 0) {
+          const audioFile = imagenesS3.find(file => isAudioFile(file.contentType));
+          if (audioFile) {
+            console.log(`[AUDIO] Detectado archivo de audio de WhatsApp: ${audioFile.url}`);
+            const transcribedText = await transcribeAudio(audioFile.url, audioFile.contentType.split('/')[1]);
+            if (transcribedText && transcribedText.trim()) {
+              inputText = transcribedText.trim();
+              console.log(`[AUDIO] Texto transcrito de WhatsApp: "${inputText}"`);
+            } else {
+              inputText = "He recibido tu mensaje de audio pero no pude entender lo que dijiste. ¿Podrías escribirme o enviar el audio de nuevo?";
+              console.log('[AUDIO] No se pudo transcribir el audio de WhatsApp');
+            }
+          }
+        }
+      } catch (e) { console.warn("Meta media:", e?.message); }
     } else if (twilioData) {
       isWhatsApp = true;
       isTwilio = true;
@@ -394,7 +495,21 @@ export const handler = async (event) => {
           const buf = await downloadTwilioMedia(m.url);
           const mime = m.contentType || "image/jpeg";
           const ext = (mime.split("/")[1] || "jpg").split(";")[0];
-          imagenesS3.push(await putMedia(buf, mime, userId, ext));
+          const mediaFile = await putMedia(buf, mime, userId, ext);
+          imagenesS3.push(mediaFile);
+          
+          // Procesar audio para transcripción si es un archivo de audio
+          if (isAudioFile(mime)) {
+            console.log(`[AUDIO] Detectado archivo de audio de Twilio: ${mediaFile.url}`);
+            const transcribedText = await transcribeAudio(mediaFile.url, ext);
+            if (transcribedText && transcribedText.trim()) {
+              inputText = transcribedText.trim();
+              console.log(`[AUDIO] Texto transcrito de Twilio: "${inputText}"`);
+            } else {
+              inputText = "He recibido tu mensaje de audio pero no pude entender lo que dijiste. ¿Podrías escribirme o enviar el audio de nuevo?";
+              console.log('[AUDIO] No se pudo transcribir el audio de Twilio');
+            }
+          }
         }
       } catch (e) { console.warn("Twilio media:", e?.message || e); }
     } else {
