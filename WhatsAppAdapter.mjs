@@ -62,17 +62,24 @@ export const handler = async (event) => {
 
     // Preparar mensaje para WhatsApp
     let mensaje = 'Sin respuesta IA';
-    if (Array.isArray(response.reply) && response.reply[0]?.text) {
-      mensaje = response.reply[0].text;
+    if (Array.isArray(response.reply) && response.reply.length > 0) {
+      // Concatenar todos los mensajes de texto de la respuesta
+      const mensajes = response.reply
+        .filter(item => item?.type === 'text' && item?.text)
+        .map(item => item.text);
+      
+      if (mensajes.length > 0) {
+        mensaje = mensajes.join('\n\n');
 
-      // Agregar respuesta al historial
-      history.push({
-        role: "assistant",
-        content: [{ type: "text", text: mensaje }]
-      });
+        // Agregar respuesta completa al historial
+        history.push({
+          role: "assistant",
+          content: response.reply
+        });
 
-      // Guardar historial actualizado
-      memory[userId] = history;
+        // Guardar historial actualizado
+        memory[userId] = history;
+      }
     }
 
     return {
