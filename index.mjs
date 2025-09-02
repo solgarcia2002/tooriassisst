@@ -112,6 +112,37 @@ const dividirRespuesta = (texto) => {
 
 const esperar = (ms) => new Promise(res => setTimeout(res, ms));
 
+// Función para verificar la disponibilidad del servicio de transcripción
+const checkTranscribeServiceHealth = async () => {
+  try {
+    console.log('[TRANSCRIBE_HEALTH] Verificando estado del servicio AWS Transcribe...');
+    
+    // Intentar listar trabajos de transcripción para verificar permisos
+    const { ListTranscriptionJobsCommand } = await import("@aws-sdk/client-transcribe");
+    const listCommand = new ListTranscriptionJobsCommand({
+      MaxResults: 1
+    });
+    
+    const result = await transcribe.send(listCommand);
+    console.log('[TRANSCRIBE_HEALTH] ✅ Servicio AWS Transcribe disponible y permisos correctos');
+    return true;
+    
+  } catch (error) {
+    console.error('[TRANSCRIBE_HEALTH] ❌ Error verificando servicio AWS Transcribe:', error);
+    console.error('[TRANSCRIBE_HEALTH] Tipo de error:', error.name);
+    console.error('[TRANSCRIBE_HEALTH] Mensaje:', error.message);
+    
+    if (error.name === 'AccessDenied' || error.name === 'UnauthorizedOperation') {
+      console.error('[TRANSCRIBE_HEALTH] ❌ PROBLEMA: Falta permiso para usar AWS Transcribe');
+      console.error('[TRANSCRIBE_HEALTH] Verificar IAM role con permisos: transcribe:ListTranscriptionJobs, transcribe:StartTranscriptionJob, transcribe:GetTranscriptionJob');
+    } else if (error.name === 'ServiceUnavailable') {
+      console.error('[TRANSCRIBE_HEALTH] ❌ PROBLEMA: Servicio AWS Transcribe no disponible en región', REGION);
+    }
+    
+    return false;
+  }
+};
+
 const trimHistory = (messages) =>
   messages.filter(m => m.role === "user" || m.role === "assistant").slice(-MAX_TURNS * 2);
 
@@ -209,70 +240,174 @@ const normalizePhone = (s) => (s || "").replace(/\D/g, "");
 const transcribeAudio = async (audioS3Url, audioFormat = 'ogg') => {
   try {
     console.log(`[TRANSCRIBE] Iniciando transcripción de: ${audioS3Url}`);
+    console.log(`[TRANSCRIBE] Formato de audio: ${audioFormat}`);
+    
+    // Verificar que el servicio esté disponible antes de proceder
+    const serviceHealthy = await checkTranscribeServiceHealth();
+    if (!serviceHealthy) {
+      console.error('[TRANSCRIBE] ❌ Servicio no disponible, abortando transcripción');
+      // Ejecutar diagnóstico adicional
+      await quickTranscribeDiagnostic();
+      return null;
+    }
     
     const jobName = `transcribe-job-${crypto.randomUUID()}`;
-    const mediaFormat = audioFormat === 'ogg' ? 'ogg' : audioFormat.toLowerCase();
     
-    // Iniciar trabajo de transcripción
-    const startJobCommand = new StartTranscriptionJobCommand({
+    // Mejorar el mapeo de formatos de audio
+    let mediaFormat = 'ogg'; // Default
+    if (audioFormat) {
+      const format = audioFormat.toLowerCase();
+      if (['mp3', 'mpeg'].includes(format)) {
+        mediaFormat = 'mp3';
+      } else if (['mp4', 'm4a'].includes(format)) {
+        mediaFormat = 'mp4';
+      } else if (['wav'].includes(format)) {
+        mediaFormat = 'wav';
+      } else if (['webm'].includes(format)) {
+        mediaFormat = 'webm';
+      } else if (['ogg'].includes(format)) {
+        mediaFormat = 'ogg';
+      }
+    }
+    
+    console.log(`[TRANSCRIBE] Formato de media para AWS: ${mediaFormat}`);
+    
+    // Configuración mejorada para la transcripción
+    const transcriptionConfig = {
       TranscriptionJobName: jobName,
-      LanguageCode: 'es-ES', // Español para Argentina
+      LanguageCode: 'es-AR', // Cambiar a español argentino específico
       MediaFormat: mediaFormat,
       Media: {
         MediaFileUri: audioS3Url
       },
       Settings: {
         ShowSpeakerLabels: false,
-        MaxSpeakerLabels: 1
+        MaxSpeakerLabels: 1,
+        // Configuraciones adicionales para mejorar la precisión
+        ShowAlternatives: false,
+        MaxAlternatives: 1,
+        // Filtrar palabras profanas si es necesario
+        VocabularyFilterMethod: 'remove'
       }
-    });
+    };
     
-    await transcribe.send(startJobCommand);
-    console.log(`[TRANSCRIBE] Trabajo iniciado: ${jobName}`);
+    console.log(`[TRANSCRIBE] Configuración del trabajo:`, JSON.stringify(transcriptionConfig, null, 2));
     
-    // Esperar a que termine la transcripción
+    // Iniciar trabajo de transcripción
+    const startJobCommand = new StartTranscriptionJobCommand(transcriptionConfig);
+    
+    const startResult = await transcribe.send(startJobCommand);
+    console.log(`[TRANSCRIBE] Trabajo iniciado exitosamente: ${jobName}`);
+    console.log(`[TRANSCRIBE] Estado inicial:`, startResult.TranscriptionJob?.TranscriptionJobStatus);
+    
+    // Esperar a que termine la transcripción con timeout más largo
     let jobStatus = 'IN_PROGRESS';
     let attempts = 0;
-    const maxAttempts = 30; // 30 intentos = ~30 segundos máximo
+    const maxAttempts = 60; // 60 intentos = ~60 segundos máximo (aumentado)
+    const waitTime = 1000; // 1 segundo entre intentos
     
     while (jobStatus === 'IN_PROGRESS' && attempts < maxAttempts) {
-      await esperar(1000); // Esperar 1 segundo
+      await esperar(waitTime);
       attempts++;
       
       const getJobCommand = new GetTranscriptionJobCommand({
         TranscriptionJobName: jobName
       });
       
-      const result = await transcribe.send(getJobCommand);
-      jobStatus = result.TranscriptionJob.TranscriptionJobStatus;
-      
-      console.log(`[TRANSCRIBE] Estado del trabajo (${attempts}/${maxAttempts}): ${jobStatus}`);
-      
-      if (jobStatus === 'COMPLETED') {
-        const transcriptUri = result.TranscriptionJob.Transcript.TranscriptFileUri;
-        console.log(`[TRANSCRIBE] Transcripción completada: ${transcriptUri}`);
+      try {
+        const result = await transcribe.send(getJobCommand);
+        jobStatus = result.TranscriptionJob?.TranscriptionJobStatus || 'UNKNOWN';
         
-        // Descargar y parsear el resultado
-        const transcriptResponse = await fetch(transcriptUri);
-        const transcriptData = await transcriptResponse.json();
+        // Log más detallado cada 10 intentos para evitar spam
+        if (attempts % 10 === 0 || jobStatus !== 'IN_PROGRESS') {
+          console.log(`[TRANSCRIBE] Estado del trabajo (${attempts}/${maxAttempts}): ${jobStatus}`);
+        }
         
-        const transcribedText = transcriptData.results.transcripts[0]?.transcript || '';
-        console.log(`[TRANSCRIBE] Texto transcrito: "${transcribedText}"`);
+        if (jobStatus === 'COMPLETED') {
+          const transcriptUri = result.TranscriptionJob.Transcript?.TranscriptFileUri;
+          if (!transcriptUri) {
+            console.error('[TRANSCRIBE] No se encontró URI de transcripción en el resultado completado');
+            return null;
+          }
+          
+          console.log(`[TRANSCRIBE] Transcripción completada: ${transcriptUri}`);
+          
+          // Descargar y parsear el resultado con mejor manejo de errores
+          try {
+            const transcriptResponse = await fetch(transcriptUri);
+            if (!transcriptResponse.ok) {
+              console.error(`[TRANSCRIBE] Error al descargar transcripción: ${transcriptResponse.status} ${transcriptResponse.statusText}`);
+              return null;
+            }
+            
+            const transcriptData = await transcriptResponse.json();
+            console.log(`[TRANSCRIBE] Datos de transcripción recibidos:`, JSON.stringify(transcriptData, null, 2));
+            
+            const transcribedText = transcriptData.results?.transcripts?.[0]?.transcript || '';
+            
+            if (transcribedText.trim()) {
+              console.log(`[TRANSCRIBE] Texto transcrito exitosamente: "${transcribedText}"`);
+              logTranscriptionAttempt(audioS3Url, audioFormat, true, null, transcribedText.trim());
+              return transcribedText.trim();
+            } else {
+              console.warn('[TRANSCRIBE] La transcripción está vacía o no contiene texto');
+              logTranscriptionAttempt(audioS3Url, audioFormat, false, new Error('Empty transcription result'), null);
+              return null;
+            }
+            
+          } catch (fetchError) {
+            console.error('[TRANSCRIBE] Error al procesar resultado de transcripción:', fetchError);
+            return null;
+          }
+          
+        } else if (jobStatus === 'FAILED') {
+          const failureReason = result.TranscriptionJob?.FailureReason || 'Razón desconocida';
+          console.error(`[TRANSCRIBE] Trabajo falló: ${failureReason}`);
+          console.error(`[TRANSCRIBE] Detalles completos del trabajo fallido:`, JSON.stringify(result.TranscriptionJob, null, 2));
+          logTranscriptionAttempt(audioS3Url, audioFormat, false, new Error(`Transcription job failed: ${failureReason}`), null);
+          return null;
+        }
         
-        return transcribedText;
-      } else if (jobStatus === 'FAILED') {
-        console.error(`[TRANSCRIBE] Trabajo falló: ${result.TranscriptionJob.FailureReason}`);
-        return null;
+      } catch (pollError) {
+        console.error(`[TRANSCRIBE] Error al consultar estado del trabajo (intento ${attempts}):`, pollError);
+        // Continuar intentando a menos que sea un error crítico
+        if (pollError.name === 'AccessDenied' || pollError.name === 'UnauthorizedOperation') {
+          console.error('[TRANSCRIBE] Error de permisos, abortando transcripción');
+          return null;
+        }
       }
     }
     
     if (attempts >= maxAttempts) {
-      console.error('[TRANSCRIBE] Timeout esperando transcripción');
+      console.error(`[TRANSCRIBE] Timeout esperando transcripción después de ${attempts} intentos (${attempts * waitTime / 1000} segundos)`);
+      
+      // Intentar cancelar el trabajo para limpiar recursos
+      try {
+        // AWS Transcribe no tiene comando de cancelación, pero podemos loggearlo para monitoreo
+        console.log(`[TRANSCRIBE] Trabajo ${jobName} puede seguir ejecutándose en background`);
+      } catch (cleanupError) {
+        console.error('[TRANSCRIBE] Error en limpieza:', cleanupError);
+      }
+      
       return null;
     }
     
   } catch (error) {
-    console.error('[TRANSCRIBE] Error en transcripción:', error);
+    console.error('[TRANSCRIBE] Error crítico en transcripción:', error);
+    console.error('[TRANSCRIBE] Stack trace:', error.stack);
+    
+    // Log adicional para debugging
+    if (error.name) {
+      console.error(`[TRANSCRIBE] Tipo de error: ${error.name}`);
+    }
+    if (error.code) {
+      console.error(`[TRANSCRIBE] Código de error: ${error.code}`);
+    }
+    if (error.message) {
+      console.error(`[TRANSCRIBE] Mensaje de error: ${error.message}`);
+    }
+    
+    logTranscriptionAttempt(audioS3Url, audioFormat, false, error, null);
     return null;
   }
 };
@@ -282,6 +417,55 @@ const isAudioFile = (contentType) => {
   if (!contentType) return false;
   const audioTypes = ['audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/webm', 'audio/aac'];
   return audioTypes.some(type => contentType.toLowerCase().includes(type.split('/')[1]));
+};
+
+// Función para logging detallado de intentos de transcripción
+const logTranscriptionAttempt = (audioUrl, audioFormat, success, error = null, transcribedText = null) => {
+  const timestamp = new Date().toISOString();
+  const logData = {
+    timestamp,
+    audioUrl,
+    audioFormat,
+    success,
+    error: error ? {
+      name: error.name,
+      message: error.message,
+      code: error.code
+    } : null,
+    transcribedText: success ? transcribedText : null,
+    textLength: success && transcribedText ? transcribedText.length : 0
+  };
+  
+  console.log(`[TRANSCRIBE_LOG] ${JSON.stringify(logData)}`);
+  return logData;
+};
+
+// Función de diagnóstico rápido para AWS Transcribe
+const quickTranscribeDiagnostic = async () => {
+  try {
+    console.log('[DIAGNOSTIC] 🔍 Iniciando diagnóstico rápido de AWS Transcribe...');
+    
+    // Verificar permisos básicos
+    const { ListTranscriptionJobsCommand } = await import("@aws-sdk/client-transcribe");
+    const listCommand = new ListTranscriptionJobsCommand({ MaxResults: 3 });
+    const result = await transcribe.send(listCommand);
+    
+    console.log('[DIAGNOSTIC] ✅ Permisos de Transcribe verificados');
+    console.log(`[DIAGNOSTIC] 📊 Trabajos recientes encontrados: ${result.TranscriptionJobSummaries?.length || 0}`);
+    
+    if (result.TranscriptionJobSummaries?.length > 0) {
+      result.TranscriptionJobSummaries.forEach((job, i) => {
+        console.log(`[DIAGNOSTIC] ${i+1}. ${job.TranscriptionJobName} - ${job.TranscriptionJobStatus} (${job.LanguageCode || 'N/A'})`);
+      });
+    }
+    
+    return true;
+  } catch (error) {
+    console.error('[DIAGNOSTIC] ❌ Error en diagnóstico:', error);
+    console.error('[DIAGNOSTIC] Tipo:', error.name);
+    console.error('[DIAGNOSTIC] Mensaje:', error.message);
+    return false;
+  }
 };
 
 export const handler = async (event) => {
@@ -437,14 +621,26 @@ export const handler = async (event) => {
           const audioFile = imagenesS3.find(file => isAudioFile(file.contentType));
           if (audioFile) {
             console.log(`[AUDIO] Detectado archivo de audio de WhatsApp: ${audioFile.url}`);
-            const transcribedText = await transcribeAudio(audioFile.url, audioFile.contentType.split('/')[1]);
-            if (transcribedText && transcribedText.trim()) {
-              inputText = transcribedText.trim();
-              console.log(`[AUDIO] Texto transcrito de WhatsApp: "${inputText}"`);
-            } else {
-              inputText = "He recibido tu mensaje de audio pero no pude entender lo que dijiste. ¿Podrías escribirme o enviar el audio de nuevo?";
-              console.log('[AUDIO] No se pudo transcribir el audio de WhatsApp');
+            console.log(`[AUDIO] Content type del archivo: ${audioFile.contentType}`);
+            
+            try {
+              const audioExtension = audioFile.contentType.split('/')[1];
+              console.log(`[AUDIO] Iniciando transcripción de WhatsApp con extensión: ${audioExtension}`);
+              
+              const transcribedText = await transcribeAudio(audioFile.url, audioExtension);
+              if (transcribedText && transcribedText.trim()) {
+                inputText = transcribedText.trim();
+                console.log(`[AUDIO] ✅ Transcripción exitosa de WhatsApp: "${inputText}"`);
+              } else {
+                console.warn('[AUDIO] ⚠️ Transcripción vacía de WhatsApp');
+                inputText = "He recibido tu mensaje de audio pero no pude entender lo que dijiste. ¿Podrías escribirme o enviar el audio de nuevo?";
+              }
+            } catch (transcribeError) {
+              console.error('[AUDIO] ❌ Error transcribiendo audio de WhatsApp:', transcribeError);
+              inputText = "He recibido tu mensaje de audio pero hubo un problema al procesarlo. ¿Podrías escribirme o intentar de nuevo?";
             }
+          } else {
+            console.warn('[AUDIO] ⚠️ No se encontró archivo de audio válido en imagenesS3 para WhatsApp');
           }
         }
       } catch (e) { console.warn("Meta media:", e?.message); }
@@ -501,13 +697,22 @@ export const handler = async (event) => {
           // Procesar audio para transcripción si es un archivo de audio
           if (isAudioFile(mime)) {
             console.log(`[AUDIO] Detectado archivo de audio de Twilio: ${mediaFile.url}`);
-            const transcribedText = await transcribeAudio(mediaFile.url, ext);
-            if (transcribedText && transcribedText.trim()) {
-              inputText = transcribedText.trim();
-              console.log(`[AUDIO] Texto transcrito de Twilio: "${inputText}"`);
-            } else {
-              inputText = "He recibido tu mensaje de audio pero no pude entender lo que dijiste. ¿Podrías escribirme o enviar el audio de nuevo?";
-              console.log('[AUDIO] No se pudo transcribir el audio de Twilio');
+            console.log(`[AUDIO] MIME type: ${mime}, extensión: ${ext}`);
+            
+            try {
+              console.log(`[AUDIO] Iniciando transcripción de Twilio con extensión: ${ext}`);
+              const transcribedText = await transcribeAudio(mediaFile.url, ext);
+              
+              if (transcribedText && transcribedText.trim()) {
+                inputText = transcribedText.trim();
+                console.log(`[AUDIO] ✅ Transcripción exitosa de Twilio: "${inputText}"`);
+              } else {
+                console.warn('[AUDIO] ⚠️ Transcripción vacía de Twilio');
+                inputText = "He recibido tu mensaje de audio pero no pude entender lo que dijiste. ¿Podrías escribirme o enviar el audio de nuevo?";
+              }
+            } catch (transcribeError) {
+              console.error('[AUDIO] ❌ Error transcribiendo audio de Twilio:', transcribeError);
+              inputText = "He recibido tu mensaje de audio pero hubo un problema al procesarlo. ¿Podrías escribirme o intentar de nuevo?";
             }
           }
         }
@@ -525,33 +730,119 @@ export const handler = async (event) => {
       // Handle media from WhatsAppAdapter.mjs
       if (parsed.mediaInfo?.medias && inputText === '[AUDIO_MESSAGE_TO_TRANSCRIBE]') {
         console.log('[WHATSAPP_ADAPTER] Processing audio message from WhatsAppAdapter');
+        console.log(`[WHATSAPP_ADAPTER] Total medias to process: ${parsed.mediaInfo.medias.length}`);
+        
         try {
-          for (const media of parsed.mediaInfo.medias) {
+          let audioProcessed = false;
+          
+          for (const [index, media] of parsed.mediaInfo.medias.entries()) {
+            console.log(`[WHATSAPP_ADAPTER] Processing media ${index + 1}/${parsed.mediaInfo.medias.length}`);
+            console.log(`[WHATSAPP_ADAPTER] Media URL: ${media.url}`);
+            console.log(`[WHATSAPP_ADAPTER] Media Content-Type: ${media.contentType}`);
+            
             if (media.url && media.contentType?.includes('audio')) {
               console.log(`[AUDIO] Processing audio from WhatsAppAdapter: ${media.url}`);
+              console.log(`[AUDIO] Audio content type: ${media.contentType}`);
               
-              // Download and save the audio file to S3
-              const audioBuffer = await downloadTwilioMedia(media.url);
-              const audioExtension = media.contentType.split('/')[1] || 'ogg';
-              const audioFile = await putMedia(audioBuffer, media.contentType, userId, audioExtension);
-              imagenesS3.push(audioFile);
-              
-              // Transcribe the audio
-              const transcribedText = await transcribeAudio(audioFile.url, audioExtension);
-              if (transcribedText && transcribedText.trim()) {
-                inputText = transcribedText.trim();
-                console.log(`[AUDIO] Texto transcrito desde WhatsAppAdapter: "${inputText}"`);
-              } else {
-                inputText = "He recibido tu mensaje de audio pero no pude entender lo que dijiste. ¿Podrías escribirme o enviar el audio de nuevo?";
-                console.log('[AUDIO] No se pudo transcribir el audio desde WhatsAppAdapter');
+              try {
+                // Download and save the audio file to S3
+                console.log('[AUDIO] Downloading audio file from Twilio...');
+                const audioBuffer = await downloadTwilioMedia(media.url);
+                console.log(`[AUDIO] Audio downloaded successfully, size: ${audioBuffer.length} bytes`);
+                
+                const audioExtension = media.contentType.split('/')[1] || 'ogg';
+                console.log(`[AUDIO] Detected audio extension: ${audioExtension}`);
+                
+                console.log('[AUDIO] Uploading audio to S3...');
+                const audioFile = await putMedia(audioBuffer, media.contentType, userId, audioExtension);
+                console.log(`[AUDIO] Audio uploaded to S3: ${audioFile.url}`);
+                imagenesS3.push(audioFile);
+                
+                // Transcribe the audio
+                console.log('[AUDIO] Starting transcription process...');
+                const transcribedText = await transcribeAudio(audioFile.url, audioExtension);
+                
+                if (transcribedText && transcribedText.trim()) {
+                  inputText = transcribedText.trim();
+                  console.log(`[AUDIO] ✅ Transcripción exitosa desde WhatsAppAdapter: "${inputText}"`);
+                  audioProcessed = true;
+                } else {
+                  console.warn('[AUDIO] ⚠️ Transcripción vacía o nula desde WhatsAppAdapter');
+                  inputText = "Parece que intentaste mandar un mensaje de audio, pero no me llegó la transcripción del mismo.";
+                }
+                
+              } catch (audioError) {
+                console.error('[AUDIO] ❌ Error específico procesando audio individual:', audioError);
+                console.error('[AUDIO] Error stack:', audioError.stack);
+                inputText = "He recibido tu mensaje de audio pero hubo un problema técnico al procesarlo. ¿Podrías intentar enviarlo de nuevo o escribirme el mensaje?";
               }
+              
               break; // Process only the first audio file
+            } else {
+              console.log(`[WHATSAPP_ADAPTER] Media ${index + 1} is not audio, skipping`);
             }
           }
+          
+          if (!audioProcessed && inputText === '[AUDIO_MESSAGE_TO_TRANSCRIBE]') {
+            console.warn('[WHATSAPP_ADAPTER] No se encontraron archivos de audio válidos para procesar');
+            inputText = "Parece que intentaste mandar un mensaje de audio, pero no pude procesarlo. ¿Podrías intentar de nuevo?";
+          }
+          
         } catch (e) {
-          console.error('[AUDIO] Error processing audio from WhatsAppAdapter:', e);
+          console.error('[AUDIO] ❌ Error general processing audio from WhatsAppAdapter:', e);
+          console.error('[AUDIO] Error type:', e.name);
+          console.error('[AUDIO] Error message:', e.message);
+          console.error('[AUDIO] Error stack:', e.stack);
           inputText = "He recibido tu mensaje de audio pero hubo un error al procesarlo. ¿Podrías escribirme o intentar de nuevo?";
         }
+      }
+    }
+
+    // Comando especial para diagnóstico de transcripción
+    if (inputText === 'DIAGNOSTIC_TRANSCRIBE' || inputText === '/diagnostic') {
+      console.log('[DIAGNOSTIC] 🔧 Comando de diagnóstico activado por usuario');
+      
+      try {
+        await quickTranscribeDiagnostic();
+        
+        // Verificar servicio de transcripción
+        const healthCheck = await checkTranscribeServiceHealth();
+        
+        const diagnosticMessages = [
+          "🔧 **Diagnóstico de Transcripción Ejecutado**",
+          healthCheck ? "✅ Servicio AWS Transcribe: DISPONIBLE" : "❌ Servicio AWS Transcribe: NO DISPONIBLE",
+          `📍 Región AWS: ${REGION}`,
+          `🗂️ Bucket S3: ${MEDIA_BUCKET}`,
+          "",
+          "📋 **Próximos pasos:**",
+          "1. Envía un mensaje de audio para probar",
+          "2. Revisa los logs detallados en CloudWatch",
+          "3. Verifica permisos IAM si hay errores"
+        ];
+        
+        return {
+          statusCode: 200,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            reply: diagnosticMessages.map(msg => ({ type: "text", text: msg })),
+            history: history
+          })
+        };
+        
+      } catch (diagError) {
+        console.error('[DIAGNOSTIC] Error ejecutando diagnóstico:', diagError);
+        
+        return {
+          statusCode: 200,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            reply: [
+              { type: "text", text: "❌ Error ejecutando diagnóstico" },
+              { type: "text", text: `Detalles: ${diagError.message}` }
+            ],
+            history: history
+          })
+        };
       }
     }
 
