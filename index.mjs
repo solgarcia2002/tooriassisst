@@ -27,6 +27,8 @@ Usá modismos suaves y abreviaciones comunes (tipo "x", "tmb", "info", "urgente"
 
 IMPORTANTE: Revisá siempre el historial de la conversación para no repetir preguntas ya hechas o información ya dada.
 
+🚨 EMERGENCIAS DE GAS: Si detectás olor a gas o problemas con gas, respondé INMEDIATAMENTE con medidas de seguridad (ventilar, no encender luces, salir del lugar, llamar bomberos). Es PRIORIDAD ABSOLUTA.
+
 Reglas clave:
 - Respondé con calidez y cercanía, como si charlaras por WhatsApp.
 - Usá oraciones cortas, divididas en párrafos naturales.
@@ -36,6 +38,7 @@ Reglas clave:
 - Pedí una foto del problema, siempre.
 - Si el usuario ya te saludó, no vuelvas a presentarte.
 - Si ya tenés algún dato (nombre, dirección, etc.), no lo vuelvas a pedir.
+- Si el usuario manda mensajes vacíos pero ya hablaron de un problema antes, preguntá específicamente por ese tema.
 
 Secuencia de información a recopilar (solo preguntá lo que falta):
 1. Si es el primer mensaje: saludo buena onda + frase motivadora + presentación.
@@ -48,7 +51,10 @@ Secuencia de información a recopilar (solo preguntá lo que falta):
 8. Preguntá si es urgente.
 9. Sugerí medida preventiva (si aplica).
 
-Si el usuario manda mensajes vacíos o confusos repetidamente, ayudalo a expresar su problema.
+Si el usuario manda mensajes vacíos o confusos repetidamente:
+- Primera vez: preguntá qué necesita
+- Segunda vez: ofrecé opciones específicas (plomería, gas, electricidad, etc.)
+- Tercera vez: sugerí que llame si no puede escribir
 
 ⚠️ Solo cuando tengas TODA la información, prepará este bloque JSON (no mostrar al cliente):
 [RESUMEN_JSON]
@@ -251,10 +257,16 @@ export const handler = async (event) => {
           try {
             if (/^[A-Za-z0-9+/]+=*$/.test(singleKey)) {
               decodedBody = Buffer.from(singleKey, 'base64').toString('utf8');
-              console.log("Body decodificado de base64:", decodedBody);
+              console.log("Body decodificado de base64:", decodedBody.substring(0, 300));
             }
           } catch (e) {
-            console.log("No es base64 válido, usando como está");
+            console.log("No es base64 válido, intentando URL decode");
+            try {
+              decodedBody = decodeURIComponent(singleKey);
+              console.log("Body decodificado URL:", decodedBody.substring(0, 300));
+            } catch (urlError) {
+              console.log("URL decode también falló, usando como está");
+            }
           }
           
           // Re-parse with the potentially decoded body
@@ -397,20 +409,32 @@ export const handler = async (event) => {
     }
 
     // Handle empty messages more intelligently
-    if (!inputText && imagenesS3.length === 0) {
+    if (!inputText || inputText === 'mensaje vacío') {
       // Check if this is a repeated empty message
-      const recentMessages = history.slice(-4); // Check last 4 messages
+      const recentMessages = history.slice(-6); // Check last 6 messages
       const recentEmptyMessages = recentMessages.filter(m => 
-        m.role === "user" && m.content?.[0]?.text === "mensaje vacío"
+        m.role === "user" && (m.content?.[0]?.text === "mensaje vacío" || !m.content?.[0]?.text?.trim())
       );
       
-      if (recentEmptyMessages.length >= 2) {
+      // Check if we have any context about gas problems from recent conversation
+      const hasGasContext = recentMessages.some(m => 
+        m.role === "user" && m.content?.[0]?.text?.toLowerCase().includes('gas')
+      );
+      
+      if (recentEmptyMessages.length >= 3) {
+        // Too many empty messages, ask for clarification
+        inputText = "necesito ayuda urgente pero no puedo escribir bien, ayúdame";
+      } else if (recentEmptyMessages.length >= 2 && hasGasContext) {
+        // Multiple empty messages but we know it's about gas - might be an emergency
+        inputText = "sigo teniendo el problema de gas que mencioné antes";
+      } else if (recentEmptyMessages.length >= 2) {
         // User sent multiple empty messages, ask for clarification
         inputText = "necesito ayuda pero no sé cómo explicar mi problema";
-      } else {
+      } else if (imagenesS3.length === 0) {
         inputText = "mensaje vacío";
       }
-      console.log(`[DEBUG] Mensaje vacío detectado para userId: ${userId}, recientes: ${recentEmptyMessages.length}`);
+      
+      console.log(`[DEBUG] Mensaje vacío procesado para userId: ${userId}, recientes: ${recentEmptyMessages.length}, contexto gas: ${hasGasContext}`);
     }
 
     console.log(`[DEBUG] InputText: "${inputText}", UserId: ${userId}, HistoryLength: ${history.length}`);

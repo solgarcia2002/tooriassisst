@@ -77,15 +77,56 @@ export const handler = async (event) => {
       const metaMsg = form?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
       messageId = metaMsg?.id || null;
     } else {
-      const parsed = querystring.parse(event.body);
-      if (Object.keys(parsed).length === 1 && Object.values(parsed)[0].includes('=')) {
-        const onlyKey = Object.keys(parsed)[0];
+      // Handle Twilio form data which might be Base64 encoded
+      let bodyToParse = event.body;
+      
+      // First try to parse normally
+      let parsed = querystring.parse(bodyToParse);
+      let allKeys = Object.keys(parsed);
+      
+      console.log('Initial parsing - Keys found:', allKeys.length);
+      console.log('First key sample:', allKeys[0]?.substring(0, 100));
+      
+      // If we have only one key and it looks like Base64 encoded data
+      if (allKeys.length === 1 && allKeys[0].length > 100 && !parsed[allKeys[0]]) {
+        const singleKey = allKeys[0];
+        console.log('Detected potential Base64 encoded form data');
+        
+        try {
+          // Try to decode as Base64
+          if (/^[A-Za-z0-9+/]+=*$/.test(singleKey)) {
+            const decodedBody = Buffer.from(singleKey, 'base64').toString('utf8');
+            console.log('Successfully decoded Base64 body:', decodedBody.substring(0, 200));
+            bodyToParse = decodedBody;
+            parsed = querystring.parse(bodyToParse);
+            allKeys = Object.keys(parsed);
+            console.log('After Base64 decoding - Keys found:', allKeys.length);
+          }
+        } catch (decodeError) {
+          console.log('Base64 decode failed, trying URL decode:', decodeError.message);
+          // Try URL decoding instead
+          try {
+            const urlDecoded = decodeURIComponent(singleKey);
+            parsed = querystring.parse(urlDecoded);
+            allKeys = Object.keys(parsed);
+            console.log('After URL decoding - Keys found:', allKeys.length);
+          } catch (urlError) {
+            console.log('URL decode also failed:', urlError.message);
+          }
+        }
+      }
+      
+      // If still having issues with nested encoding
+      if (allKeys.length === 1 && Object.values(parsed)[0] === '' && allKeys[0].includes('=')) {
+        console.log('Detected nested form encoding, attempting to parse the key itself');
+        const onlyKey = allKeys[0];
         form = querystring.parse(decodeURIComponent(onlyKey));
       } else {
         form = parsed;
       }
+      
       // For Twilio format, try to get message SID as ID
-      messageId = form?.MessageSid || null;
+      messageId = form?.MessageSid || form?.SmsSid || null;
     }
   } catch (e) {
     console.error('Error al parsear el body:', e);
@@ -100,12 +141,33 @@ export const handler = async (event) => {
   if (form?.Body?.trim?.()) {
     // Twilio format
     mensajeUsuario = form.Body.trim();
+    console.log('Message extracted from Twilio Body field:', mensajeUsuario);
   } else if (form?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.text?.body) {
     // Meta WhatsApp webhook format
     mensajeUsuario = form.entry[0].changes[0].value.messages[0].text.body.trim();
+    console.log('Message extracted from Meta webhook format:', mensajeUsuario);
+  } else {
+    // Try to find any field that might contain the message
+    console.log('Standard extraction failed, trying fallback methods...');
+    console.log('Form keys available:', Object.keys(form));
+    
+    // Look for common Twilio fields that might contain the message
+    const possibleMessageFields = ['Body', 'body', 'Text', 'text', 'Message', 'message'];
+    for (const field of possibleMessageFields) {
+      if (form[field] && typeof form[field] === 'string' && form[field].trim()) {
+        mensajeUsuario = form[field].trim();
+        console.log(`Message found in field '${field}':`, mensajeUsuario);
+        break;
+      }
+    }
+    
+    // If still empty, log the form structure for debugging
+    if (mensajeUsuario === 'mensaje vacío') {
+      console.log('No message found in any field. Full form structure:', JSON.stringify(form, null, 2));
+    }
   }
   
-  console.log('Extracted message:', mensajeUsuario);
+  console.log('Final extracted message:', mensajeUsuario);
   
   // Extract and normalize phone number to match index.mjs format
   let phone = null;
