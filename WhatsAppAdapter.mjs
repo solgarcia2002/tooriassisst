@@ -129,15 +129,26 @@ export const handler = async (event) => {
           if (/^[A-Za-z0-9+/]+=*$/.test(onlyKey) && onlyKey.length > 100) {
             console.log('Attempting Base64 decode in fallback');
             const decodedBody = Buffer.from(onlyKey, 'base64').toString('utf8');
+            console.log('Fallback Base64 decoded content:', decodedBody.substring(0, 200));
             form = querystring.parse(decodedBody);
             console.log('Fallback Base64 decode successful, keys:', Object.keys(form).length);
           } else {
             // Try URL decoding
-            form = querystring.parse(decodeURIComponent(onlyKey));
+            const urlDecoded = decodeURIComponent(onlyKey);
+            form = querystring.parse(urlDecoded);
+            console.log('URL decode successful, keys:', Object.keys(form).length);
           }
         } catch (fallbackError) {
           console.log('Fallback parsing failed:', fallbackError.message);
-          form = parsed;
+          // If all parsing fails, try to extract from the original body directly
+          try {
+            console.log('Attempting direct body parsing as last resort');
+            form = querystring.parse(event.body);
+            console.log('Direct body parsing result, keys:', Object.keys(form).length);
+          } catch (directError) {
+            console.log('Direct body parsing also failed:', directError.message);
+            form = parsed;
+          }
         }
       } else {
         form = parsed;
@@ -149,6 +160,33 @@ export const handler = async (event) => {
   } catch (e) {
     console.error('Error al parsear el body:', e);
     form = {};
+    
+    // Try one last attempt to extract basic info from raw body if everything else failed
+    if (event.body) {
+      console.log('Attempting emergency parsing from raw body...');
+      try {
+        // Try to extract basic Twilio fields with regex as last resort
+        const bodyMatch = event.body.match(/Body=([^&]+)/);
+        const fromMatch = event.body.match(/From=([^&]+)/);
+        const waidMatch = event.body.match(/WaId=([^&]+)/);
+        
+        if (bodyMatch || fromMatch || waidMatch) {
+          form = {};
+          if (bodyMatch) {
+            form.Body = decodeURIComponent(bodyMatch[1].replace(/\+/g, ' '));
+          }
+          if (fromMatch) {
+            form.From = decodeURIComponent(fromMatch[1]);
+          }
+          if (waidMatch) {
+            form.WaId = decodeURIComponent(waidMatch[1]);
+          }
+          console.log('Emergency parsing successful:', Object.keys(form));
+        }
+      } catch (emergencyError) {
+        console.log('Emergency parsing also failed:', emergencyError.message);
+      }
+    }
   }
 
   console.log('Form parseado OK:', form, 'MessageId:', messageId);
@@ -176,6 +214,23 @@ export const handler = async (event) => {
         mensajeUsuario = form[field].trim();
         console.log(`Message found in field '${field}':`, mensajeUsuario);
         break;
+      }
+    }
+    
+    // If still empty and we have only one form key that might be malformed data, try to extract from it
+    if (mensajeUsuario === 'mensaje vacío' && Object.keys(form).length === 1) {
+      const singleKey = Object.keys(form)[0];
+      const singleValue = Object.values(form)[0];
+      
+      // Try to extract Body parameter from the key itself (in case parsing failed)
+      const bodyMatch = singleKey.match(/Body=([^&]+)/);
+      if (bodyMatch) {
+        try {
+          mensajeUsuario = decodeURIComponent(bodyMatch[1].replace(/\+/g, ' ')).trim();
+          console.log('Message extracted from malformed form key:', mensajeUsuario);
+        } catch (e) {
+          console.log('Failed to decode message from form key:', e.message);
+        }
       }
     }
     
@@ -209,6 +264,49 @@ export const handler = async (event) => {
       normalizedPhone,
       phoneNumberId 
     });
+  } else if (form?.WaId) {
+    // Try to extract from WaId directly if From is missing
+    const waid = form.WaId;
+    const normalizedPhone = normalizePhone(waid);
+    userId = `wa:${normalizedPhone}`;
+    phone = `+${normalizedPhone}`;
+    
+    console.log('Phone extracted from WaId field:', { waid, normalizedPhone, userId });
+    logConversationState(userId, 'PHONE_EXTRACTED', { 
+      originalFrom: null, 
+      phone, 
+      waid, 
+      normalizedPhone,
+      phoneNumberId 
+    });
+  } else if (Object.keys(form).length === 1) {
+    // Try to extract phone from malformed form key
+    const singleKey = Object.keys(form)[0];
+    const fromMatch = singleKey.match(/From=whatsapp%3A%2B(\d+)/);
+    const waidMatch = singleKey.match(/WaId=(\d+)/);
+    
+    if (fromMatch) {
+      const normalizedPhone = normalizePhone(fromMatch[1]);
+      userId = `wa:${normalizedPhone}`;
+      phone = `+${normalizedPhone}`;
+      console.log('Phone extracted from malformed From field:', { normalizedPhone, userId });
+    } else if (waidMatch) {
+      const normalizedPhone = normalizePhone(waidMatch[1]);
+      userId = `wa:${normalizedPhone}`;
+      phone = `+${normalizedPhone}`;
+      console.log('Phone extracted from malformed WaId field:', { normalizedPhone, userId });
+    }
+    
+    if (userId !== 'anon') {
+      logConversationState(userId, 'PHONE_EXTRACTED', { 
+        originalFrom: null, 
+        phone, 
+        waid: normalizedPhone, 
+        normalizedPhone,
+        phoneNumberId,
+        extractedFromMalformedKey: true
+      });
+    }
   } else if (form?.entry?.[0]?.changes?.[0]?.value) {
     // Handle Meta WhatsApp webhook format
     const value = form.entry[0].changes[0].value;
