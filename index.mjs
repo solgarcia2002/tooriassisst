@@ -112,6 +112,9 @@ const loadHistory = async (userId) => {
     const res = await s3.send(new GetObjectCommand({ Bucket: HISTORY_BUCKET, Key: key }));
     const body = await streamToString(res.Body);
     const parsed = JSON.parse(body);
+    
+    console.log(`[DEBUG] Historial cargado para ${userId}:`, JSON.stringify(parsed, null, 2));
+    
     return Array.isArray(parsed) ? parsed : [];
   } catch (e) {
     if (DEBUG_S3) console.warn("[S3][GET] vacío o error:", e?.name, e?.message);
@@ -122,6 +125,9 @@ const loadHistory = async (userId) => {
 const saveHistory = async (userId, history) => {
   const key = `history/${encodeURIComponent(userId)}.json`;
   const body = JSON.stringify(history);
+  
+  console.log(`[DEBUG] Guardando en S3 para ${userId}:`, JSON.stringify(history, null, 2));
+  
   if (DEBUG_S3) console.log("[S3][PUT]", HISTORY_BUCKET, key, "bytes:", Buffer.byteLength(body));
   await s3.send(new PutObjectCommand({
     Bucket: HISTORY_BUCKET,
@@ -387,6 +393,12 @@ export const handler = async (event) => {
     }
 
     console.log(`[DEBUG] InputText: "${inputText}", UserId: ${userId}, HistoryLength: ${history.length}`);
+    
+    // Debug: mostrar estructura del historial
+    if (history.length > 0) {
+      console.log(`[DEBUG] Último mensaje del historial:`, JSON.stringify(history[history.length - 1], null, 2));
+      console.log(`[DEBUG] Historial completo:`, JSON.stringify(history, null, 2));
+    }
 
     const baseHistory = Array.isArray(history) ? history : [];
     const safeHistory = trimHistory(baseHistory);
@@ -453,7 +465,13 @@ export const handler = async (event) => {
     }
 
     let newHistory = [...updatedMessages];
-    newHistory.push({ role: "assistant", content: [{ type: "text", text: salidaSinJson }] });
+    const assistantMessage = { role: "assistant", content: [{ type: "text", text: salidaSinJson }] };
+    newHistory.push(assistantMessage);
+    
+    console.log(`[DEBUG] Guardando historial para ${userId}:`);
+    console.log(`[DEBUG] Nuevo mensaje asistente:`, JSON.stringify(assistantMessage, null, 2));
+    console.log(`[DEBUG] Historial completo a guardar:`, JSON.stringify(newHistory, null, 2));
+    
     try { await saveHistory(userId, newHistory); } catch (e) { console.error("S3 save err:", e?.message || e); }
 
     if (isWhatsApp) {
@@ -486,6 +504,9 @@ export const handler = async (event) => {
     }
 
     const assistantReply = mensajes.map(text => ({ type: "text", text }));
+    
+    console.log("Respuesta backend:", JSON.stringify({ reply: assistantReply, history: newHistory }, null, 2));
+    
     return { statusCode: 200, body: JSON.stringify({ reply: assistantReply, history: newHistory }) };
 
   } catch (err) {
