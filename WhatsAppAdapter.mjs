@@ -323,6 +323,64 @@ export const handler = async (event) => {
 
   console.log('Form parseado OK:', form, 'MessageId:', messageId);
 
+  // Extract userId first for S3 storage
+  let phone = null;
+  let userId = null;
+  let phoneNumberId = PHONE_NUMBER_ID;
+  
+  if (form?.From) {
+    // Handle both WhatsApp Meta format and Twilio format
+    phone = form.From.replace(/^whatsapp:/, ""); // Remove whatsapp: prefix if present
+    const waid = form?.WaId || phone;
+    
+    // More robust user ID creation to maintain consistency
+    const normalizedPhone = normalizePhone(waid);
+    userId = `wa:${normalizedPhone}`;
+    
+    // Log phone number extraction for debugging
+    logConversationState(userId, 'PHONE_EXTRACTED', { 
+      originalFrom: form.From, 
+      phone, 
+      waid, 
+      normalizedPhone,
+      phoneNumberId 
+    });
+  } else if (form?.WaId) {
+    // Try to extract from WaId directly if From is missing
+    const waid = form.WaId;
+    const normalizedPhone = normalizePhone(waid);
+    userId = `wa:${normalizedPhone}`;
+    phone = `+${normalizedPhone}`;
+    
+    console.log('Phone extracted from WaId field:', { waid, normalizedPhone, userId });
+    logConversationState(userId, 'PHONE_EXTRACTED', { 
+      originalFrom: null, 
+      phone, 
+      waid, 
+      normalizedPhone,
+      phoneNumberId 
+    });
+  } else if (Object.keys(form).length === 1) {
+    // Try to extract phone from malformed form key
+    const singleKey = Object.keys(form)[0];
+    const fromMatch = singleKey.match(/From=whatsapp%3A%2B(\d+)/);
+    const waidMatch = singleKey.match(/WaId=(\d+)/);
+    
+    if (fromMatch) {
+      const normalizedPhone = normalizePhone(fromMatch[1]);
+      userId = `wa:${normalizedPhone}`;
+      phone = `+${normalizedPhone}`;
+      console.log('Phone extracted from malformed From field:', { normalizedPhone, userId });
+    } else if (waidMatch) {
+      const normalizedPhone = normalizePhone(waidMatch[1]);
+      userId = `wa:${normalizedPhone}`;
+      phone = `+${normalizedPhone}`;
+      console.log('Phone extracted from malformed WaId field:', { normalizedPhone, userId });
+    }
+  }
+
+  console.log('Phone:', phone, 'UserId:', userId, 'PhoneNumberId:', phoneNumberId);
+
   // Extract message text and media from different formats
   let mensajeUsuario = 'mensaje vacío';
   let mediaInfo = null;
@@ -350,10 +408,47 @@ export const handler = async (event) => {
     
     if (medias.length > 0) {
       mediaInfo = { medias };
-      // For audio messages, set a placeholder text that will be replaced by transcription
+      
+      // Process audio immediately if detected
       if (messageType === 'audio' || medias.some(m => m.contentType?.includes('audio'))) {
-        mensajeUsuario = '[AUDIO_MESSAGE_TO_TRANSCRIBE]';
-        console.log('Audio message detected, will be sent for transcription');
+        console.log('Audio message detected, processing transcription...');
+        
+        try {
+          // Find the audio media
+          const audioMedia = medias.find(m => isAudioFile(m.contentType));
+          if (audioMedia) {
+            console.log(`[AUDIO] Processing audio: ${audioMedia.url} (${audioMedia.contentType})`);
+            
+            // Download audio from Twilio
+            const audioBuffer = await downloadTwilioMedia(audioMedia.url);
+            
+            // Determine file extension
+            const audioExtension = audioMedia.contentType.split('/')[1] || 'ogg';
+            
+            // Use the extracted userId for S3 path, fallback to temp if not available
+            const s3UserId = userId || ('temp_' + Date.now());
+            
+            // Upload to S3
+            const s3AudioFile = await putMediaToS3(audioBuffer, audioMedia.contentType, s3UserId, audioExtension);
+            
+            // Transcribe the audio
+            const transcribedText = await transcribeAudio(s3AudioFile.url, audioExtension);
+            
+            if (transcribedText && transcribedText.trim()) {
+              mensajeUsuario = transcribedText.trim();
+              console.log(`[AUDIO] Successfully transcribed: "${mensajeUsuario}"`);
+            } else {
+              mensajeUsuario = 'He recibido tu mensaje de audio pero no pude entender lo que dijiste. ¿Podrías escribirme o enviar el audio de nuevo?';
+              console.log('[AUDIO] Transcription failed or empty');
+            }
+          } else {
+            console.log('[AUDIO] No audio file found in media');
+            mensajeUsuario = 'He recibido un archivo multimedia pero no pude procesarlo como audio.';
+          }
+        } catch (error) {
+          console.error('[AUDIO] Error processing audio:', error);
+          mensajeUsuario = 'He recibido tu mensaje de audio pero hubo un error al procesarlo. ¿Podrías escribirme o intentar de nuevo?';
+        }
       }
     }
   }
@@ -407,76 +502,18 @@ export const handler = async (event) => {
   
   console.log('Final extracted message:', mensajeUsuario);
   
-  // Extract and normalize phone number to match index.mjs format
-  let phone = null;
-  let userId = 'anon';
-  let phoneNumberId = PHONE_NUMBER_ID;
+  // Ensure we have userId, fallback to anon if extraction failed
+  if (!userId) {
+    userId = 'anon';
+  }
   
-  if (form?.From) {
-    // Handle both WhatsApp Meta format and Twilio format
-    phone = form.From.replace(/^whatsapp:/, ""); // Remove whatsapp: prefix if present
-    const waid = form?.WaId || phone;
-    
-    // More robust user ID creation to maintain consistency
-    const normalizedPhone = normalizePhone(waid);
-    userId = `wa:${normalizedPhone}`;
-    
-    // Log phone number extraction for debugging
-    logConversationState(userId, 'PHONE_EXTRACTED', { 
-      originalFrom: form.From, 
-      phone, 
-      waid, 
-      normalizedPhone,
-      phoneNumberId 
-    });
-  } else if (form?.WaId) {
-    // Try to extract from WaId directly if From is missing
-    const waid = form.WaId;
-    const normalizedPhone = normalizePhone(waid);
-    userId = `wa:${normalizedPhone}`;
-    phone = `+${normalizedPhone}`;
-    
-    console.log('Phone extracted from WaId field:', { waid, normalizedPhone, userId });
-    logConversationState(userId, 'PHONE_EXTRACTED', { 
-      originalFrom: null, 
-      phone, 
-      waid, 
-      normalizedPhone,
-      phoneNumberId 
-    });
-  } else if (Object.keys(form).length === 1) {
-    // Try to extract phone from malformed form key
-    const singleKey = Object.keys(form)[0];
-    const fromMatch = singleKey.match(/From=whatsapp%3A%2B(\d+)/);
-    const waidMatch = singleKey.match(/WaId=(\d+)/);
-    
-    if (fromMatch) {
-      const normalizedPhone = normalizePhone(fromMatch[1]);
-      userId = `wa:${normalizedPhone}`;
-      phone = `+${normalizedPhone}`;
-      console.log('Phone extracted from malformed From field:', { normalizedPhone, userId });
-    } else if (waidMatch) {
-      const normalizedPhone = normalizePhone(waidMatch[1]);
-      userId = `wa:${normalizedPhone}`;
-      phone = `+${normalizedPhone}`;
-      console.log('Phone extracted from malformed WaId field:', { normalizedPhone, userId });
-    }
-    
-    if (userId !== 'anon') {
-      logConversationState(userId, 'PHONE_EXTRACTED', { 
-        originalFrom: null, 
-        phone, 
-        waid: normalizedPhone, 
-        normalizedPhone,
-        phoneNumberId,
-        extractedFromMalformedKey: true
-      });
-    }
-  } else if (form?.entry?.[0]?.changes?.[0]?.value) {
-    // Handle Meta WhatsApp webhook format
-    const value = form.entry[0].changes[0].value;
-    const contact = value.contacts?.[0];
-    const message = value.messages?.[0];
+  // Handle Meta WhatsApp webhook format if not already processed
+  if (!userId || userId === 'anon') {
+    if (form?.entry?.[0]?.changes?.[0]?.value) {
+      // Handle Meta WhatsApp webhook format
+      const value = form.entry[0].changes[0].value;
+      const contact = value.contacts?.[0];
+      const message = value.messages?.[0];
     
     if (contact?.wa_id || message?.from) {
       const waid = contact?.wa_id || message?.from;
@@ -494,6 +531,7 @@ export const handler = async (event) => {
         phoneNumberId,
         metadataPhoneId: value.metadata?.phone_number_id
       });
+      }
     }
   }
   
