@@ -225,16 +225,17 @@ export const handler = async (event) => {
       const parsed = rawBody ? JSON.parse(rawBody) : {};
       inputText = typeof parsed.input === "string" ? parsed.input : parsed.input?.text;
       
-      // Para web, generar siempre una nueva sesión a menos que se proporcione explícitamente un userId
-      // Esto asegura que cada recarga de página inicie una conversación fresca
-      const baseId = parsed.userId || 
-                     parsed?.requestContext?.requestId || 
-                     crypto.randomUUID() || 
-                     `anon-${Date.now()}`;
-      userId = `web:${baseId}`;
+      // Mantener sesión persistente para web usando sessionId o crear uno nuevo si no existe
+      const sessionId = parsed.sessionId || 
+                       parsed.userId || 
+                       parsed?.requestContext?.requestId || 
+                       `session-${Date.now()}-${crypto.randomUUID().slice(0,8)}`;
+      userId = `web:${sessionId}`;
       
-      // Solo cargar historial si se proporcionó un userId explícito (para mantener sesión existente)
-      history = parsed.userId ? await loadHistory(userId) : [];
+      // Siempre cargar historial para mantener contexto
+      history = await loadHistory(userId);
+      
+      console.log(`[DEBUG] Web session - SessionId: ${sessionId}, UserId: ${userId}, History loaded: ${history.length} messages`);
     }
 
     // si no hay texto ni media -> registrar como mensaje vacío pero continuar conversación
@@ -245,14 +246,57 @@ export const handler = async (event) => {
     
     console.log(`[DEBUG] InputText: "${inputText}", UserId: ${userId}, HistoryLength: ${history.length}`);
 
-    // ===== Prompt del sistema =====
-    const systemPrompt = {
-      role: "user",
-      content: [{
-        type: "text",
-        text: `Actuás como un asistente virtual joven, experto en ayudar a inquilinos con problemas en casa. 
+    // ===== Análisis del estado de la conversación =====
+    const analyzeConversationState = (history) => {
+      const userMessages = history.filter(msg => msg.role === "user").map(msg => 
+        msg.content?.[0]?.text || ""
+      ).join(" ").toLowerCase();
+      
+      const assistantMessages = history.filter(msg => msg.role === "assistant").map(msg => 
+        msg.content?.[0]?.text || ""
+      ).join(" ").toLowerCase();
+      
+      return {
+        hasName: /nombre|llamo|soy\s+\w+/.test(userMessages) || /tu nombre|cómo te llam/.test(assistantMessages),
+        hasAddress: /dirección|domicilio|vivo en|casa/.test(userMessages) || /dirección|domicilio/.test(assistantMessages),
+        hasProblem: /problema|roto|no funciona|se rompió/.test(userMessages) || /qué pasó|problema/.test(assistantMessages),
+        hasUrgency: /urgente|ya|ahora|rápido/.test(userMessages) || /urgente/.test(assistantMessages),
+        isGreeted: assistantMessages.includes("hola") || assistantMessages.includes("buenas")
+      };
+    };
+    
+    const conversationState = analyzeConversationState(baseHistory);
+    console.log(`[DEBUG] Conversation state:`, conversationState);
+
+    // ===== Prompt del sistema dinámico =====
+    const buildSystemPrompt = (state) => {
+      let contextualInstructions = "";
+      
+      if (state.hasName && state.hasAddress && state.hasProblem) {
+        contextualInstructions = `
+IMPORTANTE: El usuario ya proporcionó información básica. NO vuelvas a preguntar por:
+- Su nombre (ya lo tiene)
+- Su dirección (ya la tiene) 
+- El problema básico (ya lo describió)
+
+Continuá con los siguientes pasos según corresponda:
+- Si falta: tipo de técnico necesario
+- Si falta: urgencia del problema
+- Si falta: foto del problema
+- Finalizá con el resumen JSON cuando tengas todo.`;
+      } else if (state.isGreeted) {
+        contextualInstructions = `
+IMPORTANTE: Ya saludaste al usuario. NO repitas el saludo inicial.
+Continuá con el siguiente paso de información que falte según la secuencia.`;
+      }
+
+      return {
+        role: "user",
+        content: [{
+          type: "text",
+          text: `Actuás como un asistente virtual joven, experto en ayudar a inquilinos con problemas en casa. 
 Respondés en estilo conversacional argentino, breve y directo, como en un chat real. 
-Usá modismos suaves y abreviaciones comunes (tipo “x”, “tmb”, “info”, “urgente”, etc).
+Usá modismos suaves y abreviaciones comunes (tipo "x", "tmb", "info", "urgente", etc).
 
 Reglas clave:
 - Respondé con calidez y cercanía, como si charlaras por WhatsApp.
@@ -261,8 +305,11 @@ Reglas clave:
 - Hacé solo una pregunta a la vez.
 - Nunca le digas al cliente que se arregle solo. Nosotros nos encargamos.
 - Pedí una foto del problema, siempre.
+- MANTENÉ EL CONTEXTO: recordá lo que ya te dijeron.
 
-Secuencia obligatoria:
+${contextualInstructions}
+
+Secuencia obligatoria (solo avanzá al siguiente paso si no tenés la info):
 1. Arrancá con saludo buena onda + frase motivadora.
 2. Pedí nombre completo.
 3. Preguntá si es el inquilino o alguien más.
@@ -284,12 +331,25 @@ Secuencia obligatoria:
   "problema": "Descripción breve del problema"
 }
 [/RESUMEN_JSON]`
-      }]
+        }]
+      };
     };
 
+    const systemPrompt = buildSystemPrompt(conversationState);
+
     const baseHistory = Array.isArray(history) ? history : [];
-    const fullHistory = baseHistory.length === 0 ? [systemPrompt] : baseHistory; // evita reinyectar prompt
+    
+    // Verificar si ya existe el prompt del sistema en el historial
+    const hasSystemPrompt = baseHistory.some(msg => 
+      msg.role === "user" && 
+      msg.content?.[0]?.text?.includes("Actuás como un asistente virtual joven")
+    );
+    
+    // Solo agregar prompt del sistema si no existe o si es una nueva conversación
+    const fullHistory = hasSystemPrompt ? baseHistory : [systemPrompt, ...baseHistory];
     const safeHistory = trimHistory(fullHistory);
+    
+    console.log(`[DEBUG] System prompt injection - Has system prompt: ${hasSystemPrompt}, Full history length: ${fullHistory.length}`);
 
     const updatedMessages = [
       ...safeHistory,
@@ -387,7 +447,15 @@ Secuencia obligatoria:
 
     // Web/API
     const assistantReply = mensajes.map(text => ({ type: "text", text }));
-    return { statusCode: 200, body: JSON.stringify({ reply: assistantReply, history: newHistory }) };
+    return { 
+      statusCode: 200, 
+      body: JSON.stringify({ 
+        reply: assistantReply, 
+        history: newHistory,
+        sessionId: userId.replace('web:', ''), // Devolver sessionId para que el cliente lo use en próximas llamadas
+        contextMaintained: history.length > 0 // Indicar si se mantuvo contexto
+      }) 
+    };
 
   } catch (err) {
     console.error("🔥 Error general:", err);
