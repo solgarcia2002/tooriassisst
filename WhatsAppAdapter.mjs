@@ -1,10 +1,21 @@
 import querystring from 'querystring';
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { TranscribeClient, StartTranscriptionJobCommand, GetTranscriptionJobCommand } from "@aws-sdk/client-transcribe";
+import crypto from "crypto";
 
 // Normalize phone number to match index.mjs format
 const normalizePhone = (s) => (s || "").replace(/\D/g, "");
 
-// Get PHONE_NUMBER_ID from environment for consistency
+// Get environment variables
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const REGION = process.env.AWS_REGION || "us-west-2";
+const MEDIA_BUCKET = process.env.MEDIA_BUCKET || "toori360";
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+
+// Initialize AWS clients
+const s3 = new S3Client({ region: REGION });
+const transcribe = new TranscribeClient({ region: REGION });
 
 const memory = {}; // Historial temporal por usuario
 
