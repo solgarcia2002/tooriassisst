@@ -1,5 +1,8 @@
 import querystring from 'querystring';
 
+// Normalize phone number to match index.mjs format
+const normalizePhone = (s) => (s || "").replace(/\D/g, "");
+
 const memory = {}; // Historial temporal por usuario
 
 export const handler = async (event) => {
@@ -7,10 +10,14 @@ export const handler = async (event) => {
   console.log('Headers:', event.headers);
 
   let form;
+  let messageId = null;
 
   try {
     if (event.headers['content-type']?.includes('application/json')) {
       form = JSON.parse(event.body);
+      // Extract message ID from WhatsApp webhook format
+      const metaMsg = form?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+      messageId = metaMsg?.id || null;
     } else {
       const parsed = querystring.parse(event.body);
       if (Object.keys(parsed).length === 1 && Object.values(parsed)[0].includes('=')) {
@@ -19,25 +26,61 @@ export const handler = async (event) => {
       } else {
         form = parsed;
       }
+      // For Twilio format, try to get message SID as ID
+      messageId = form?.MessageSid || null;
     }
   } catch (e) {
     console.error('Error al parsear el body:', e);
     form = {};
   }
 
-  console.log('Form parseado OK:', form);
+  console.log('Form parseado OK:', form, 'MessageId:', messageId);
 
   const mensajeUsuario = form?.Body?.trim?.() || 'mensaje vacío';
-  const userId = form?.From || 'anon'; // ej: whatsapp:+549351...
+  
+  // Extract and normalize phone number to match index.mjs format
+  let phone = null;
+  let userId = 'anon';
+  
+  if (form?.From) {
+    // Handle both WhatsApp Meta format and Twilio format
+    phone = form.From.replace(/^whatsapp:/, ""); // Remove whatsapp: prefix if present
+    const waid = form?.WaId || phone;
+    userId = `wa:${normalizePhone(waid)}`;
+  }
+  
+  console.log('Phone:', phone, 'UserId:', userId);
 
   // Obtener historial previo o crear nuevo
   let history = memory[userId] || [];
 
-  // Agregar el nuevo mensaje del usuario
-  history.push({
+  // Check for duplicate messages using messageId
+  if (messageId) {
+    const recentMessages = history.slice(-10); // Check last 10 messages
+    const isDuplicate = recentMessages.some(msg => 
+      msg.role === "user" && 
+      msg.content?.[0]?.text === mensajeUsuario &&
+      msg.messageId === messageId
+    );
+    
+    if (isDuplicate) {
+      console.log(`[DEBUG] Mensaje duplicado detectado: ${messageId}`);
+      return {
+        statusCode: 200,
+        headers: { "Content-Type": "application/xml" },
+        body: `<Response></Response>` // Empty response for duplicates
+      };
+    }
+  }
+
+  // Agregar el nuevo mensaje del usuario con messageId
+  const userMessage = {
     role: "user",
-    content: [{ type: "text", text: mensajeUsuario }]
-  });
+    content: [{ type: "text", text: mensajeUsuario }],
+    ...(messageId && { messageId })
+  };
+  
+  history.push(userMessage);
 
   const payload = {
     input: { type: "text", text: mensajeUsuario },
