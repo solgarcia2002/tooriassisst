@@ -728,10 +728,27 @@ export const handler = async (event) => {
       const isTwilioAudio = media.url && media.url.includes('api.twilio.com');
       
       console.log('[AUDIO_FLOW] Has Twilio Auth:', hasTwilioAuth);
+      console.log('[AUDIO_FLOW] TWILIO_ACCOUNT_SID exists:', !!TWILIO_ACCOUNT_SID);
+      console.log('[AUDIO_FLOW] TWILIO_AUTH_TOKEN exists:', !!TWILIO_AUTH_TOKEN);
+      console.log('[AUDIO_FLOW] TWILIO_ACCOUNT_SID value:', TWILIO_ACCOUNT_SID ? 'SET' : 'NOT_SET');
+      console.log('[AUDIO_FLOW] TWILIO_AUTH_TOKEN value:', TWILIO_AUTH_TOKEN ? 'SET' : 'NOT_SET');
       console.log('[AUDIO_FLOW] Is Twilio Audio:', isTwilioAudio);
+      console.log('[AUDIO_FLOW] Media URL:', media.url);
       console.log('[AUDIO_FLOW] ===========================================');
       
-      if (!hasTwilioAuth && isTwilioAudio) {
+      // FORCE LOCAL PROCESSING FOR TESTING - uncomment the next line to force local processing
+      // const forceLocalProcessing = true;
+      const forceLocalProcessing = false;
+      
+      if (forceLocalProcessing) {
+        console.log('[AUDIO] 🧪 FORCING LOCAL PROCESSING FOR TESTING');
+        console.log('[AUDIO] Processing audio locally (forced)...');
+        console.log('[AUDIO] Starting local transcription process...');
+        const transcribed = await transcribeAudio(media, userId);
+        console.log('[AUDIO] Local transcription result:', transcribed);
+        messageText = transcribed || 'No pude entender el audio';
+        console.log('[AUDIO] Final message text:', messageText);
+      } else if (!hasTwilioAuth && isTwilioAudio) {
         console.log('[AUDIO] Twilio audio detected without credentials, forwarding to main backend');
         
         // Forward to main backend for processing
@@ -777,8 +794,12 @@ export const handler = async (event) => {
         }
       } else {
         // Process audio locally
+        console.log('[AUDIO] Processing audio locally with credentials');
+        console.log('[AUDIO] Starting local transcription process...');
         const transcribed = await transcribeAudio(media, userId);
+        console.log('[AUDIO] Local transcription result:', transcribed);
         messageText = transcribed || 'No pude entender el audio';
+        console.log('[AUDIO] Final message text:', messageText);
       }
     }
     
