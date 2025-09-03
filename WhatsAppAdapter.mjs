@@ -582,6 +582,14 @@ export const handler = async (event) => {
     whatsappToken: WHATSAPP_TOKEN ? 'present' : 'missing'
   });
   
+  console.log('[WEBHOOK] Raw event received:');
+  console.log('[WEBHOOK] Headers:', JSON.stringify(event.headers, null, 2));
+  console.log('[WEBHOOK] Method:', event.httpMethod || event.requestContext?.http?.method);
+  console.log('[WEBHOOK] Content-Type:', event.headers?.['content-type'] || event.headers?.['Content-Type']);
+  console.log('[WEBHOOK] Body type:', typeof event.body);
+  console.log('[WEBHOOK] Body length:', event.body?.length);
+  console.log('[WEBHOOK] Raw body preview:', event.body?.substring(0, 500));
+  
   // Handle webhook verification for Meta WhatsApp
   if (event.httpMethod === 'GET' && event.queryStringParameters) {
     const mode = event.queryStringParameters['hub.mode'];
@@ -606,6 +614,8 @@ export const handler = async (event) => {
   try {
     // 1. Parse form
     const form = parseBody(event);
+    console.log('[PARSE] Form keys:', Object.keys(form));
+    console.log('[PARSE] Form data preview:', JSON.stringify(form, null, 2).substring(0, 1000));
     
     // 2. Extract basic info
     const phone = extractPhone(form, event);
