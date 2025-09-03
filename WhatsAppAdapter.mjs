@@ -216,9 +216,12 @@ const downloadMedia = async (mediaUrl, useWhatsAppAuth = true) => {
     } else {
       // Use Twilio authentication for Twilio media
       authHeader = getTwilioAuth();
-      console.log(`[MEDIA] Using Twilio auth`);
       if (!authHeader) {
-        throw new Error('Twilio credentials not configured');
+        console.log('[AUTH] Twilio credentials not configured - using WhatsApp API instead');
+        authHeader = `Bearer ${WHATSAPP_TOKEN}`;
+        console.log(`[MEDIA] Falling back to WhatsApp API auth`);
+      } else {
+        console.log(`[MEDIA] Using Twilio auth`);
       }
     }
     
