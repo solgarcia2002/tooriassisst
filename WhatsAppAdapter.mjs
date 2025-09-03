@@ -626,6 +626,12 @@ export const handler = async (event) => {
     let messageText = extractMessage(form);
     const media = extractMediaUrl(form);
     
+    console.log('[DEBUG] Message extraction results:');
+    console.log('[DEBUG] messageText:', messageText);
+    console.log('[DEBUG] media:', JSON.stringify(media, null, 2));
+    console.log('[DEBUG] media contentType:', media?.contentType);
+    console.log('[DEBUG] isAudio check:', media && isAudio(media.contentType));
+    
     // 4. Handle audio
     if (media && isAudio(media.contentType)) {
       console.log('Processing audio message...');
