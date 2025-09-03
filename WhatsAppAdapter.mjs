@@ -195,9 +195,19 @@ const extractMediaUrl = (form) => {
 };
 
 const isTwilioMessage = (form) => {
-  // Force WhatsApp API usage instead of Twilio to avoid credential issues
-  return false;
-  // Original logic: return !!(form.From || form.WaId || form.MessageSid);
+  // Detect Twilio messages by checking for Twilio-specific fields
+  const hasTwilioFields = !!(form.From || form.WaId || form.MessageSid || form.MediaUrl0);
+  
+  // If we have Twilio fields but no Twilio credentials, we'll still process as Twilio
+  // but use WhatsApp auth for media downloads
+  if (hasTwilioFields) {
+    console.log('[TWILIO] Detected Twilio message format');
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+      console.log('[TWILIO] No Twilio credentials available, will use WhatsApp auth for media');
+    }
+  }
+  
+  return hasTwilioFields;
 };
 
 // ==========================================
@@ -226,12 +236,40 @@ const downloadMedia = async (mediaUrl, useWhatsAppAuth = true) => {
     }
     
     const response = await fetch(mediaUrl, { 
-      headers: { Authorization: authHeader } 
+      headers: { 
+        Authorization: authHeader,
+        'User-Agent': 'AWS Lambda Function'
+      } 
     });
+    
+    console.log(`[MEDIA] Response status: ${response.status}`);
+    console.log(`[MEDIA] Response headers:`, Object.fromEntries(response.headers.entries()));
     
     if (!response.ok) {
       console.error(`[MEDIA] Download failed: ${response.status} ${response.statusText}`);
-      console.error(`[MEDIA] Response headers:`, Object.fromEntries(response.headers.entries()));
+      
+      // If using WhatsApp auth failed and this looks like a Twilio URL, try without auth
+      if (useWhatsAppAuth && mediaUrl.includes('api.twilio.com')) {
+        console.log('[MEDIA] WhatsApp auth failed on Twilio URL, trying without auth...');
+        try {
+          const noAuthResponse = await fetch(mediaUrl, { 
+            headers: { 'User-Agent': 'AWS Lambda Function' } 
+          });
+          
+          console.log(`[MEDIA] No-auth response status: ${noAuthResponse.status}`);
+          
+          if (noAuthResponse.ok) {
+            const buffer = await noAuthResponse.arrayBuffer();
+            console.log(`[MEDIA] ✅ Downloaded ${buffer.byteLength} bytes without auth`);
+            return Buffer.from(buffer);
+          } else {
+            console.error(`[MEDIA] No-auth download also failed: ${noAuthResponse.status}`);
+          }
+        } catch (noAuthError) {
+          console.error('[MEDIA] No-auth download error:', noAuthError);
+        }
+      }
+      
       throw new Error(`Download failed: ${response.status}`);
     }
     
@@ -245,7 +283,19 @@ const downloadMedia = async (mediaUrl, useWhatsAppAuth = true) => {
 };
 
 const uploadToS3 = async (buffer, contentType, userId) => {
-  const fileName = `audio/${userId}/${crypto.randomUUID()}.ogg`;
+  // Extract file extension from content type
+  let extension = 'ogg'; // default
+  if (contentType) {
+    const mimeType = contentType.split('/')[1];
+    if (mimeType) {
+      extension = mimeType.split(';')[0]; // Remove any additional parameters
+    }
+  }
+  
+  const fileName = `media/${userId}/${crypto.randomUUID()}.${extension}`;
+  
+  console.log(`[S3] Uploading audio to: s3://${MEDIA_BUCKET}/${fileName}`);
+  console.log(`[S3] Content type: ${contentType}, Size: ${buffer.length} bytes`);
   
   await s3.send(new PutObjectCommand({
     Bucket: MEDIA_BUCKET,
@@ -254,44 +304,105 @@ const uploadToS3 = async (buffer, contentType, userId) => {
     ContentType: contentType
   }));
   
+  console.log(`[S3] Upload successful: s3://${MEDIA_BUCKET}/${fileName}`);
   return `s3://${MEDIA_BUCKET}/${fileName}`;
 };
 
 const startTranscription = async (audioUrl) => {
   const jobName = `job-${crypto.randomUUID()}`;
   
+  // Extract format from URL
+  let mediaFormat = 'ogg'; // default
+  if (audioUrl) {
+    const urlParts = audioUrl.split('.');
+    const extension = urlParts[urlParts.length - 1];
+    if (['mp3', 'mpeg'].includes(extension)) {
+      mediaFormat = 'mp3';
+    } else if (['mp4', 'm4a'].includes(extension)) {
+      mediaFormat = 'mp4';
+    } else if (['wav'].includes(extension)) {
+      mediaFormat = 'wav';
+    } else if (['webm'].includes(extension)) {
+      mediaFormat = 'webm';
+    } else if (['ogg'].includes(extension)) {
+      mediaFormat = 'ogg';
+    }
+  }
+  
+  console.log(`[TRANSCRIBE] Starting transcription job: ${jobName}`);
+  console.log(`[TRANSCRIBE] Audio URL: ${audioUrl}`);
+  console.log(`[TRANSCRIBE] Media format: ${mediaFormat}`);
+  
   await transcribe.send(new StartTranscriptionJobCommand({
     TranscriptionJobName: jobName,
-    LanguageCode: 'es-ES',
-    MediaFormat: 'ogg',
-    Media: { MediaFileUri: audioUrl }
+    LanguageCode: 'es-AR', // Español argentino
+    MediaFormat: mediaFormat,
+    Media: { MediaFileUri: audioUrl },
+    Settings: {
+      ShowSpeakerLabels: false,
+      MaxSpeakerLabels: 1,
+      ShowAlternatives: false,
+      MaxAlternatives: 1
+    }
   }));
   
   return jobName;
 };
 
 const getTranscriptionResult = async (jobName) => {
+  console.log(`[TRANSCRIBE] Waiting for transcription job: ${jobName}`);
+  
   for (let i = 0; i < 30; i++) {
     await wait(2000);
     
-    const result = await transcribe.send(new GetTranscriptionJobCommand({
-      TranscriptionJobName: jobName
-    }));
-    
-    const status = result.TranscriptionJob.TranscriptionJobStatus;
-    
-    if (status === 'COMPLETED') {
-      const transcriptUri = result.TranscriptionJob.Transcript.TranscriptFileUri;
-      const response = await fetch(transcriptUri);
-      const data = await response.json();
-      return data.results.transcripts[0]?.transcript || '';
-    }
-    
-    if (status === 'FAILED') {
-      throw new Error('Transcription failed');
+    try {
+      const result = await transcribe.send(new GetTranscriptionJobCommand({
+        TranscriptionJobName: jobName
+      }));
+      
+      const status = result.TranscriptionJob.TranscriptionJobStatus;
+      
+      // Log every 5 attempts to avoid spam
+      if (i % 5 === 0 || status !== 'IN_PROGRESS') {
+        console.log(`[TRANSCRIBE] Job status (${i + 1}/30): ${status}`);
+      }
+      
+      if (status === 'COMPLETED') {
+        const transcriptUri = result.TranscriptionJob.Transcript.TranscriptFileUri;
+        if (!transcriptUri) {
+          console.error('[TRANSCRIBE] No transcript URI found in completed job');
+          return '';
+        }
+        
+        console.log(`[TRANSCRIBE] Downloading transcript from: ${transcriptUri}`);
+        const response = await fetch(transcriptUri);
+        
+        if (!response.ok) {
+          console.error(`[TRANSCRIBE] Failed to download transcript: ${response.status}`);
+          return '';
+        }
+        
+        const data = await response.json();
+        const transcript = data.results?.transcripts?.[0]?.transcript || '';
+        console.log(`[TRANSCRIBE] ✅ Transcription completed: "${transcript}"`);
+        return transcript;
+      }
+      
+      if (status === 'FAILED') {
+        const failureReason = result.TranscriptionJob?.FailureReason || 'Unknown reason';
+        console.error(`[TRANSCRIBE] ❌ Transcription failed: ${failureReason}`);
+        throw new Error(`Transcription failed: ${failureReason}`);
+      }
+    } catch (error) {
+      console.error(`[TRANSCRIBE] Error checking job status (attempt ${i + 1}):`, error);
+      // Continue trying unless it's the last attempt
+      if (i === 29) {
+        throw error;
+      }
     }
   }
   
+  console.error('[TRANSCRIBE] ❌ Transcription timeout after 30 attempts');
   throw new Error('Transcription timeout');
 };
 
@@ -317,11 +428,16 @@ const transcribeAudio = async (media, userId) => {
       console.log(`[AUDIO] Got WhatsApp media URL: ${metaData.url}`);
       buffer = await downloadMedia(metaData.url, true); // Use WhatsApp auth
     } else if (media.url) {
-      // Direct URL (Twilio format)
-      buffer = await downloadMedia(media.url, false); // Use Twilio auth
+      // Direct URL (could be Twilio or WhatsApp format)
+      // Check if Twilio credentials are available
+      const hasTwilioAuth = !!(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN);
+      console.log(`[AUDIO] Processing direct URL with ${hasTwilioAuth ? 'Twilio' : 'WhatsApp'} auth`);
+      buffer = await downloadMedia(media.url, !hasTwilioAuth); // Use WhatsApp auth if Twilio not available
     } else {
       throw new Error('No valid media URL or ID provided');
     }
+    
+    console.log(`[AUDIO] Buffer obtained, size: ${buffer.length} bytes`);
     
     const s3Url = await uploadToS3(buffer, contentType, userId);
     console.log(`[AUDIO] Uploaded to S3: ${s3Url}`);
@@ -332,7 +448,10 @@ const transcribeAudio = async (media, userId) => {
     console.log('[AUDIO] Transcribed:', text);
     return text;
   } catch (error) {
-    console.error('[AUDIO] Error:', error);
+    console.error('[AUDIO] ❌ Error processing audio:', error);
+    console.error('[AUDIO] Error type:', error.name);
+    console.error('[AUDIO] Error message:', error.message);
+    console.error('[AUDIO] Error stack:', error.stack);
     return null;
   }
 };
@@ -510,8 +629,60 @@ export const handler = async (event) => {
     // 4. Handle audio
     if (media && isAudio(media.contentType)) {
       console.log('Processing audio message...');
-      const transcribed = await transcribeAudio(media, userId);
-      messageText = transcribed || 'No pude entender el audio';
+      
+      // Check if this is a Twilio audio without credentials
+      const hasTwilioAuth = !!(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN);
+      const isTwilioAudio = media.url && media.url.includes('api.twilio.com');
+      
+      if (!hasTwilioAuth && isTwilioAudio) {
+        console.log('[AUDIO] Twilio audio detected without credentials, forwarding to main backend');
+        
+        // Forward to main backend for processing
+        const payload = {
+          input: { type: "text", text: "[AUDIO_MESSAGE_TO_TRANSCRIBE]" },
+          userId: userId,
+          mediaInfo: {
+            medias: [{
+              url: media.url,
+              contentType: media.contentType
+            }]
+          }
+        };
+        
+        try {
+          const backendResponse = await callBackend(payload);
+          
+          // Extract the transcribed text from the backend response
+          if (backendResponse && typeof backendResponse === 'object') {
+            // The backend should return the transcribed text in the reply
+            const replyText = extractReplyText(backendResponse);
+            if (replyText && !replyText.includes('problema técnico')) {
+              messageText = replyText;
+              console.log('[AUDIO] ✅ Audio processed successfully by main backend');
+              
+              // Send the response directly and return
+              const messageParts = splitMessage(replyText);
+              await sendMessages(phone, messageParts, useTwilio);
+              console.log(`Sent ${messageParts.length} messages to ${phone} (audio processed by backend)`);
+              
+              return {
+                statusCode: 200,
+                body: replyText
+              };
+            }
+          }
+          
+          console.warn('[AUDIO] Backend did not return valid transcription');
+          messageText = 'No pude procesar el audio correctamente';
+        } catch (error) {
+          console.error('[AUDIO] Error forwarding to backend:', error);
+          messageText = 'Hubo un problema técnico procesando tu audio';
+        }
+      } else {
+        // Process audio locally
+        const transcribed = await transcribeAudio(media, userId);
+        messageText = transcribed || 'No pude entender el audio';
+      }
     }
     
     if (!messageText) {

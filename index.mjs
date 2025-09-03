@@ -169,7 +169,7 @@ const saveHistory = async (userId, history) => {
 const putMedia = async (buf, contentType, userId, ext = "bin") => {
   const id = crypto.randomUUID();
   const now = new Date();
-  const key = `uploads/${now.getUTCFullYear()}/${String(now.getUTCMonth() + 1).padStart(2, "0")}/${encodeURIComponent(userId)}/${id}.${ext}`;
+  const key = `media/${encodeURIComponent(userId)}/${id}.${ext}`;
   
   console.log(`[S3] Uploading media to: s3://${MEDIA_BUCKET}/${key}`);
   console.log(`[S3] Content type: ${contentType}, Size: ${buf.length} bytes`);
