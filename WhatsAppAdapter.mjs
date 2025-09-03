@@ -510,10 +510,7 @@ export const handler = async (event) => {
     
     return {
       statusCode: 200,
-      body: JSON.stringify({ 
-        response: replyText,
-        messagesSent: messageParts.length
-      })
+      body: replyText
     };
     
   } catch (error) {
