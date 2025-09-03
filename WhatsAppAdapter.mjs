@@ -511,8 +511,7 @@ export const handler = async (event) => {
     return {
       statusCode: 200,
       body: JSON.stringify({ 
-        response: replyText,
-        messagesSent: messageParts.length
+        response: replyText
       })
     };
     
