@@ -179,6 +179,18 @@ const extractMediaUrl = (form) => {
       contentType: form.MediaContentType0 || 'audio/ogg'
     };
   }
+  
+  // WhatsApp API format
+  const message = form?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+  if (message?.audio?.id) {
+    // For WhatsApp API, we need to get the media URL using the Graph API
+    return {
+      id: message.audio.id,
+      contentType: message.audio.mime_type || 'audio/ogg',
+      isWhatsAppMedia: true
+    };
+  }
+  
   return null;
 };
 
@@ -192,11 +204,23 @@ const isTwilioMessage = (form) => {
 // MEDIA FUNCTIONS
 // ==========================================
 
-const downloadMedia = async (mediaUrl) => {
+const downloadMedia = async (mediaUrl, useWhatsAppAuth = true) => {
   try {
-    const authHeader = getTwilioAuth();
     console.log(`[MEDIA] Downloading from: ${mediaUrl}`);
-    console.log(`[MEDIA] Auth header length: ${authHeader.length}`);
+    
+    let authHeader;
+    if (useWhatsAppAuth) {
+      // Use WhatsApp API authentication for WhatsApp media
+      authHeader = `Bearer ${WHATSAPP_TOKEN}`;
+      console.log(`[MEDIA] Using WhatsApp API auth`);
+    } else {
+      // Use Twilio authentication for Twilio media
+      authHeader = getTwilioAuth();
+      console.log(`[MEDIA] Using Twilio auth`);
+      if (!authHeader) {
+        throw new Error('Twilio credentials not configured');
+      }
+    }
     
     const response = await fetch(mediaUrl, { 
       headers: { Authorization: authHeader } 
@@ -227,7 +251,7 @@ const uploadToS3 = async (buffer, contentType, userId) => {
     ContentType: contentType
   }));
   
-  return `https://${MEDIA_BUCKET}.s3.${REGION}.amazonaws.com/${fileName}`;
+  return `s3://${MEDIA_BUCKET}/${fileName}`;
 };
 
 const startTranscription = async (audioUrl) => {
@@ -268,12 +292,37 @@ const getTranscriptionResult = async (jobName) => {
   throw new Error('Transcription timeout');
 };
 
-const transcribeAudio = async (mediaUrl, userId) => {
+const transcribeAudio = async (media, userId) => {
   try {
     console.log('[AUDIO] Processing audio...');
     
-    const buffer = await downloadMedia(mediaUrl);
-    const s3Url = await uploadToS3(buffer, 'audio/ogg', userId);
+    let buffer;
+    let contentType = media.contentType || 'audio/ogg';
+    
+    if (media.isWhatsAppMedia && media.id) {
+      // WhatsApp API format - need to get URL first
+      console.log(`[AUDIO] Fetching WhatsApp media URL for ID: ${media.id}`);
+      const meta = await fetch(`https://graph.facebook.com/v18.0/${media.id}`, {
+        headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
+      });
+      
+      if (!meta.ok) {
+        throw new Error(`Failed to get WhatsApp media metadata: ${meta.status}`);
+      }
+      
+      const metaData = await meta.json();
+      console.log(`[AUDIO] Got WhatsApp media URL: ${metaData.url}`);
+      buffer = await downloadMedia(metaData.url, true); // Use WhatsApp auth
+    } else if (media.url) {
+      // Direct URL (Twilio format)
+      buffer = await downloadMedia(media.url, false); // Use Twilio auth
+    } else {
+      throw new Error('No valid media URL or ID provided');
+    }
+    
+    const s3Url = await uploadToS3(buffer, contentType, userId);
+    console.log(`[AUDIO] Uploaded to S3: ${s3Url}`);
+    
     const jobName = await startTranscription(s3Url);
     const text = await getTranscriptionResult(jobName);
     
@@ -458,7 +507,7 @@ export const handler = async (event) => {
     // 4. Handle audio
     if (media && isAudio(media.contentType)) {
       console.log('Processing audio message...');
-      const transcribed = await transcribeAudio(media.url, userId);
+      const transcribed = await transcribeAudio(media, userId);
       messageText = transcribed || 'No pude entender el audio';
     }
     
