@@ -172,25 +172,43 @@ const extractMessage = (form) => {
 };
 
 const extractMediaUrl = (form) => {
+  console.log('[MEDIA_EXTRACT] ===========================================');
+  console.log('[MEDIA_EXTRACT] Extracting media from form...');
+  console.log('[MEDIA_EXTRACT] Form keys:', Object.keys(form));
+  
   // Twilio format
   if (form.MediaUrl0) {
-    return {
+    console.log('[MEDIA_EXTRACT] ✅ Twilio media detected!');
+    console.log('[MEDIA_EXTRACT] MediaUrl0:', form.MediaUrl0);
+    console.log('[MEDIA_EXTRACT] MediaContentType0:', form.MediaContentType0);
+    const media = {
       url: form.MediaUrl0,
       contentType: form.MediaContentType0 || 'audio/ogg'
     };
+    console.log('[MEDIA_EXTRACT] Returning media object:', JSON.stringify(media, null, 2));
+    console.log('[MEDIA_EXTRACT] ===========================================');
+    return media;
   }
   
   // WhatsApp API format
   const message = form?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+  console.log('[MEDIA_EXTRACT] Checking WhatsApp API format...');
+  console.log('[MEDIA_EXTRACT] Message object:', JSON.stringify(message, null, 2));
+  
   if (message?.audio?.id) {
-    // For WhatsApp API, we need to get the media URL using the Graph API
-    return {
+    console.log('[MEDIA_EXTRACT] ✅ WhatsApp API audio detected!');
+    const media = {
       id: message.audio.id,
       contentType: message.audio.mime_type || 'audio/ogg',
       isWhatsAppMedia: true
     };
+    console.log('[MEDIA_EXTRACT] Returning WhatsApp media object:', JSON.stringify(media, null, 2));
+    console.log('[MEDIA_EXTRACT] ===========================================');
+    return media;
   }
   
+  console.log('[MEDIA_EXTRACT] ❌ No media found in form');
+  console.log('[MEDIA_EXTRACT] ===========================================');
   return null;
 };
 
@@ -642,13 +660,43 @@ export const handler = async (event) => {
     console.log('[DEBUG] media contentType:', media?.contentType);
     console.log('[DEBUG] isAudio check:', media && isAudio(media.contentType));
     
+    // AUDIO DEBUGGING: Log detailed audio information
+    if (form.MessageType === 'audio' || form.NumMedia > 0) {
+      console.log('[AUDIO_DEBUG] ===========================================');
+      console.log('[AUDIO_DEBUG] Audio message detected!');
+      console.log('[AUDIO_DEBUG] MessageType:', form.MessageType);
+      console.log('[AUDIO_DEBUG] NumMedia:', form.NumMedia);
+      console.log('[AUDIO_DEBUG] MediaContentType0:', form.MediaContentType0);
+      console.log('[AUDIO_DEBUG] MediaUrl0:', form.MediaUrl0);
+      console.log('[AUDIO_DEBUG] Body:', form.Body);
+      console.log('[AUDIO_DEBUG] From:', form.From);
+      console.log('[AUDIO_DEBUG] To:', form.To);
+      console.log('[AUDIO_DEBUG] ===========================================');
+      
+      if (media) {
+        console.log('[AUDIO_DEBUG] Media object created:');
+        console.log('[AUDIO_DEBUG] - URL:', media.url);
+        console.log('[AUDIO_DEBUG] - Content Type:', media.contentType);
+        console.log('[AUDIO_DEBUG] - Is Audio?:', isAudio(media.contentType));
+      } else {
+        console.log('[AUDIO_DEBUG] ❌ No media object was created!');
+      }
+    }
+    
     // 4. Handle audio
     if (media && isAudio(media.contentType)) {
-      console.log('Processing audio message...');
+      console.log('[AUDIO_FLOW] ===========================================');
+      console.log('[AUDIO_FLOW] Starting audio processing...');
+      console.log('[AUDIO_FLOW] Media URL:', media.url);
+      console.log('[AUDIO_FLOW] Content Type:', media.contentType);
       
       // Check if this is a Twilio audio without credentials
       const hasTwilioAuth = !!(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN);
       const isTwilioAudio = media.url && media.url.includes('api.twilio.com');
+      
+      console.log('[AUDIO_FLOW] Has Twilio Auth:', hasTwilioAuth);
+      console.log('[AUDIO_FLOW] Is Twilio Audio:', isTwilioAudio);
+      console.log('[AUDIO_FLOW] ===========================================');
       
       if (!hasTwilioAuth && isTwilioAudio) {
         console.log('[AUDIO] Twilio audio detected without credentials, forwarding to main backend');
