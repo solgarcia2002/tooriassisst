@@ -172,25 +172,43 @@ const extractMessage = (form) => {
 };
 
 const extractMediaUrl = (form) => {
+  console.log('[MEDIA_EXTRACT] ===========================================');
+  console.log('[MEDIA_EXTRACT] Extracting media from form...');
+  console.log('[MEDIA_EXTRACT] Form keys:', Object.keys(form));
+  
   // Twilio format
   if (form.MediaUrl0) {
-    return {
+    console.log('[MEDIA_EXTRACT] ✅ Twilio media detected!');
+    console.log('[MEDIA_EXTRACT] MediaUrl0:', form.MediaUrl0);
+    console.log('[MEDIA_EXTRACT] MediaContentType0:', form.MediaContentType0);
+    const media = {
       url: form.MediaUrl0,
       contentType: form.MediaContentType0 || 'audio/ogg'
     };
+    console.log('[MEDIA_EXTRACT] Returning media object:', JSON.stringify(media, null, 2));
+    console.log('[MEDIA_EXTRACT] ===========================================');
+    return media;
   }
   
   // WhatsApp API format
   const message = form?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+  console.log('[MEDIA_EXTRACT] Checking WhatsApp API format...');
+  console.log('[MEDIA_EXTRACT] Message object:', JSON.stringify(message, null, 2));
+  
   if (message?.audio?.id) {
-    // For WhatsApp API, we need to get the media URL using the Graph API
-    return {
+    console.log('[MEDIA_EXTRACT] ✅ WhatsApp API audio detected!');
+    const media = {
       id: message.audio.id,
       contentType: message.audio.mime_type || 'audio/ogg',
       isWhatsAppMedia: true
     };
+    console.log('[MEDIA_EXTRACT] Returning WhatsApp media object:', JSON.stringify(media, null, 2));
+    console.log('[MEDIA_EXTRACT] ===========================================');
+    return media;
   }
   
+  console.log('[MEDIA_EXTRACT] ❌ No media found in form');
+  console.log('[MEDIA_EXTRACT] ===========================================');
   return null;
 };
 
@@ -283,29 +301,62 @@ const downloadMedia = async (mediaUrl, useWhatsAppAuth = true) => {
 };
 
 const uploadToS3 = async (buffer, contentType, userId) => {
-  // Extract file extension from content type
-  let extension = 'ogg'; // default
-  if (contentType) {
-    const mimeType = contentType.split('/')[1];
-    if (mimeType) {
-      extension = mimeType.split(';')[0]; // Remove any additional parameters
+  try {
+    console.log('[S3_UPLOAD] ===========================================');
+    console.log('[S3_UPLOAD] Starting S3 upload process...');
+    console.log('[S3_UPLOAD] Buffer size:', buffer.length, 'bytes');
+    console.log('[S3_UPLOAD] Content type:', contentType);
+    console.log('[S3_UPLOAD] User ID:', userId);
+    console.log('[S3_UPLOAD] Media bucket:', MEDIA_BUCKET);
+    
+    // Extract file extension from content type
+    let extension = 'ogg'; // default
+    if (contentType) {
+      const mimeType = contentType.split('/')[1];
+      if (mimeType) {
+        extension = mimeType.split(';')[0]; // Remove any additional parameters
+      }
     }
+    
+    const fileName = `media/${userId}/${crypto.randomUUID()}.${extension}`;
+    const fullS3Path = `s3://${MEDIA_BUCKET}/${fileName}`;
+    
+    console.log('[S3_UPLOAD] Generated file name:', fileName);
+    console.log('[S3_UPLOAD] Full S3 path:', fullS3Path);
+    console.log('[S3_UPLOAD] File extension:', extension);
+    
+    const uploadParams = {
+      Bucket: MEDIA_BUCKET,
+      Key: fileName,
+      Body: buffer,
+      ContentType: contentType
+    };
+    
+    console.log('[S3_UPLOAD] Upload parameters:', {
+      Bucket: uploadParams.Bucket,
+      Key: uploadParams.Key,
+      ContentType: uploadParams.ContentType,
+      BodySize: uploadParams.Body.length
+    });
+    
+    console.log('[S3_UPLOAD] Sending upload command to S3...');
+    const result = await s3.send(new PutObjectCommand(uploadParams));
+    
+    console.log('[S3_UPLOAD] ✅ Upload successful!');
+    console.log('[S3_UPLOAD] S3 response:', JSON.stringify(result, null, 2));
+    console.log('[S3_UPLOAD] Final S3 URL:', fullS3Path);
+    console.log('[S3_UPLOAD] ===========================================');
+    
+    return fullS3Path;
+  } catch (error) {
+    console.error('[S3_UPLOAD] ❌ S3 upload failed!');
+    console.error('[S3_UPLOAD] Error type:', error.name);
+    console.error('[S3_UPLOAD] Error message:', error.message);
+    console.error('[S3_UPLOAD] Error code:', error.code);
+    console.error('[S3_UPLOAD] Error stack:', error.stack);
+    console.error('[S3_UPLOAD] ===========================================');
+    throw error;
   }
-  
-  const fileName = `media/${userId}/${crypto.randomUUID()}.${extension}`;
-  
-  console.log(`[S3] Uploading audio to: s3://${MEDIA_BUCKET}/${fileName}`);
-  console.log(`[S3] Content type: ${contentType}, Size: ${buffer.length} bytes`);
-  
-  await s3.send(new PutObjectCommand({
-    Bucket: MEDIA_BUCKET,
-    Key: fileName,
-    Body: buffer,
-    ContentType: contentType
-  }));
-  
-  console.log(`[S3] Upload successful: s3://${MEDIA_BUCKET}/${fileName}`);
-  return `s3://${MEDIA_BUCKET}/${fileName}`;
 };
 
 const startTranscription = async (audioUrl) => {
@@ -642,15 +693,62 @@ export const handler = async (event) => {
     console.log('[DEBUG] media contentType:', media?.contentType);
     console.log('[DEBUG] isAudio check:', media && isAudio(media.contentType));
     
+    // AUDIO DEBUGGING: Log detailed audio information
+    if (form.MessageType === 'audio' || form.NumMedia > 0) {
+      console.log('[AUDIO_DEBUG] ===========================================');
+      console.log('[AUDIO_DEBUG] Audio message detected!');
+      console.log('[AUDIO_DEBUG] MessageType:', form.MessageType);
+      console.log('[AUDIO_DEBUG] NumMedia:', form.NumMedia);
+      console.log('[AUDIO_DEBUG] MediaContentType0:', form.MediaContentType0);
+      console.log('[AUDIO_DEBUG] MediaUrl0:', form.MediaUrl0);
+      console.log('[AUDIO_DEBUG] Body:', form.Body);
+      console.log('[AUDIO_DEBUG] From:', form.From);
+      console.log('[AUDIO_DEBUG] To:', form.To);
+      console.log('[AUDIO_DEBUG] ===========================================');
+      
+      if (media) {
+        console.log('[AUDIO_DEBUG] Media object created:');
+        console.log('[AUDIO_DEBUG] - URL:', media.url);
+        console.log('[AUDIO_DEBUG] - Content Type:', media.contentType);
+        console.log('[AUDIO_DEBUG] - Is Audio?:', isAudio(media.contentType));
+      } else {
+        console.log('[AUDIO_DEBUG] ❌ No media object was created!');
+      }
+    }
+    
     // 4. Handle audio
     if (media && isAudio(media.contentType)) {
-      console.log('Processing audio message...');
+      console.log('[AUDIO_FLOW] ===========================================');
+      console.log('[AUDIO_FLOW] Starting audio processing...');
+      console.log('[AUDIO_FLOW] Media URL:', media.url);
+      console.log('[AUDIO_FLOW] Content Type:', media.contentType);
       
       // Check if this is a Twilio audio without credentials
       const hasTwilioAuth = !!(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN);
       const isTwilioAudio = media.url && media.url.includes('api.twilio.com');
       
-      if (!hasTwilioAuth && isTwilioAudio) {
+      console.log('[AUDIO_FLOW] Has Twilio Auth:', hasTwilioAuth);
+      console.log('[AUDIO_FLOW] TWILIO_ACCOUNT_SID exists:', !!TWILIO_ACCOUNT_SID);
+      console.log('[AUDIO_FLOW] TWILIO_AUTH_TOKEN exists:', !!TWILIO_AUTH_TOKEN);
+      console.log('[AUDIO_FLOW] TWILIO_ACCOUNT_SID value:', TWILIO_ACCOUNT_SID ? 'SET' : 'NOT_SET');
+      console.log('[AUDIO_FLOW] TWILIO_AUTH_TOKEN value:', TWILIO_AUTH_TOKEN ? 'SET' : 'NOT_SET');
+      console.log('[AUDIO_FLOW] Is Twilio Audio:', isTwilioAudio);
+      console.log('[AUDIO_FLOW] Media URL:', media.url);
+      console.log('[AUDIO_FLOW] ===========================================');
+      
+      // FORCE LOCAL PROCESSING FOR TESTING - uncomment the next line to force local processing
+      const forceLocalProcessing = true;
+      // const forceLocalProcessing = false;
+      
+      if (forceLocalProcessing) {
+        console.log('[AUDIO] 🧪 FORCING LOCAL PROCESSING FOR TESTING');
+        console.log('[AUDIO] Processing audio locally (forced)...');
+        console.log('[AUDIO] Starting local transcription process...');
+        const transcribed = await transcribeAudio(media, userId);
+        console.log('[AUDIO] Local transcription result:', transcribed);
+        messageText = transcribed || 'No pude entender el audio';
+        console.log('[AUDIO] Final message text:', messageText);
+      } else if (!hasTwilioAuth && isTwilioAudio) {
         console.log('[AUDIO] Twilio audio detected without credentials, forwarding to main backend');
         
         // Forward to main backend for processing
@@ -696,8 +794,12 @@ export const handler = async (event) => {
         }
       } else {
         // Process audio locally
+        console.log('[AUDIO] Processing audio locally with credentials');
+        console.log('[AUDIO] Starting local transcription process...');
         const transcribed = await transcribeAudio(media, userId);
+        console.log('[AUDIO] Local transcription result:', transcribed);
         messageText = transcribed || 'No pude entender el audio';
+        console.log('[AUDIO] Final message text:', messageText);
       }
     }
     
