@@ -301,29 +301,62 @@ const downloadMedia = async (mediaUrl, useWhatsAppAuth = true) => {
 };
 
 const uploadToS3 = async (buffer, contentType, userId) => {
-  // Extract file extension from content type
-  let extension = 'ogg'; // default
-  if (contentType) {
-    const mimeType = contentType.split('/')[1];
-    if (mimeType) {
-      extension = mimeType.split(';')[0]; // Remove any additional parameters
+  try {
+    console.log('[S3_UPLOAD] ===========================================');
+    console.log('[S3_UPLOAD] Starting S3 upload process...');
+    console.log('[S3_UPLOAD] Buffer size:', buffer.length, 'bytes');
+    console.log('[S3_UPLOAD] Content type:', contentType);
+    console.log('[S3_UPLOAD] User ID:', userId);
+    console.log('[S3_UPLOAD] Media bucket:', MEDIA_BUCKET);
+    
+    // Extract file extension from content type
+    let extension = 'ogg'; // default
+    if (contentType) {
+      const mimeType = contentType.split('/')[1];
+      if (mimeType) {
+        extension = mimeType.split(';')[0]; // Remove any additional parameters
+      }
     }
+    
+    const fileName = `media/${userId}/${crypto.randomUUID()}.${extension}`;
+    const fullS3Path = `s3://${MEDIA_BUCKET}/${fileName}`;
+    
+    console.log('[S3_UPLOAD] Generated file name:', fileName);
+    console.log('[S3_UPLOAD] Full S3 path:', fullS3Path);
+    console.log('[S3_UPLOAD] File extension:', extension);
+    
+    const uploadParams = {
+      Bucket: MEDIA_BUCKET,
+      Key: fileName,
+      Body: buffer,
+      ContentType: contentType
+    };
+    
+    console.log('[S3_UPLOAD] Upload parameters:', {
+      Bucket: uploadParams.Bucket,
+      Key: uploadParams.Key,
+      ContentType: uploadParams.ContentType,
+      BodySize: uploadParams.Body.length
+    });
+    
+    console.log('[S3_UPLOAD] Sending upload command to S3...');
+    const result = await s3.send(new PutObjectCommand(uploadParams));
+    
+    console.log('[S3_UPLOAD] ✅ Upload successful!');
+    console.log('[S3_UPLOAD] S3 response:', JSON.stringify(result, null, 2));
+    console.log('[S3_UPLOAD] Final S3 URL:', fullS3Path);
+    console.log('[S3_UPLOAD] ===========================================');
+    
+    return fullS3Path;
+  } catch (error) {
+    console.error('[S3_UPLOAD] ❌ S3 upload failed!');
+    console.error('[S3_UPLOAD] Error type:', error.name);
+    console.error('[S3_UPLOAD] Error message:', error.message);
+    console.error('[S3_UPLOAD] Error code:', error.code);
+    console.error('[S3_UPLOAD] Error stack:', error.stack);
+    console.error('[S3_UPLOAD] ===========================================');
+    throw error;
   }
-  
-  const fileName = `media/${userId}/${crypto.randomUUID()}.${extension}`;
-  
-  console.log(`[S3] Uploading audio to: s3://${MEDIA_BUCKET}/${fileName}`);
-  console.log(`[S3] Content type: ${contentType}, Size: ${buffer.length} bytes`);
-  
-  await s3.send(new PutObjectCommand({
-    Bucket: MEDIA_BUCKET,
-    Key: fileName,
-    Body: buffer,
-    ContentType: contentType
-  }));
-  
-  console.log(`[S3] Upload successful: s3://${MEDIA_BUCKET}/${fileName}`);
-  return `s3://${MEDIA_BUCKET}/${fileName}`;
 };
 
 const startTranscription = async (audioUrl) => {
