@@ -737,8 +737,8 @@ export const handler = async (event) => {
       console.log('[AUDIO_FLOW] ===========================================');
       
       // FORCE LOCAL PROCESSING FOR TESTING - uncomment the next line to force local processing
-      // const forceLocalProcessing = true;
-      const forceLocalProcessing = false;
+      const forceLocalProcessing = true;
+      // const forceLocalProcessing = false;
       
       if (forceLocalProcessing) {
         console.log('[AUDIO] 🧪 FORCING LOCAL PROCESSING FOR TESTING');
