@@ -224,14 +224,54 @@ const saveWhatsAppMediaIfAny = async (msg, userId) => {
   return refs;
 };
 
-const twilioBasicAuth = () =>
-  "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+const twilioBasicAuth = () => {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+    throw new Error('Twilio credentials not configured');
+  }
+  return "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+};
+
+const downloadMedia = async (mediaUrl, useWhatsAppAuth = true) => {
+  try {
+    console.log(`[MEDIA] Downloading from: ${mediaUrl}`);
+    
+    let authHeader;
+    if (useWhatsAppAuth) {
+      // Use WhatsApp API authentication for WhatsApp media
+      authHeader = `Bearer ${WHATSAPP_TOKEN}`;
+      console.log(`[MEDIA] Using WhatsApp API auth`);
+    } else {
+      // Use Twilio authentication for Twilio media
+      if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+        console.log('[AUTH] Twilio credentials not configured - using WhatsApp API instead');
+        authHeader = `Bearer ${WHATSAPP_TOKEN}`;
+        console.log(`[MEDIA] Falling back to WhatsApp API auth`);
+      } else {
+        authHeader = twilioBasicAuth();
+        console.log(`[MEDIA] Using Twilio auth`);
+      }
+    }
+    
+    const response = await fetch(mediaUrl, { 
+      headers: { Authorization: authHeader } 
+    });
+    
+    if (!response.ok) {
+      console.error(`[MEDIA] Download failed: ${response.status} ${response.statusText}`);
+      throw new Error(`Download failed: ${response.status}`);
+    }
+    
+    const buffer = await response.arrayBuffer();
+    console.log(`[MEDIA] Downloaded ${buffer.byteLength} bytes`);
+    return Buffer.from(buffer);
+  } catch (error) {
+    console.error(`[MEDIA] Error downloading media:`, error);
+    throw error;
+  }
+};
 
 const downloadTwilioMedia = async (mediaUrl) => {
-  const r = await fetch(mediaUrl, { headers: { Authorization: twilioBasicAuth() } });
-  if (!r.ok) throw new Error(`Twilio media ${r.status}`);
-  const ab = await r.arrayBuffer();
-  return Buffer.from(ab);
+  return downloadMedia(mediaUrl, false);
 };
 
 const normalizePhone = (s) => (s || "").replace(/\D/g, "");
@@ -479,6 +519,13 @@ export const handler = async (event) => {
   let messageId = null;
 
   try {
+    console.log("Processing message...");
+    console.log('[ENV] Environment check:', {
+      twilioAccountSid: TWILIO_ACCOUNT_SID ? 'present' : 'missing',
+      twilioAuthToken: TWILIO_AUTH_TOKEN ? 'present' : 'missing',
+      phoneNumberId: PHONE_NUMBER_ID ? 'present' : 'missing',
+      whatsappToken: WHATSAPP_TOKEN ? 'present' : 'missing'
+    });
     const rawBody = typeof event.body === "string"
       ? (event.isBase64Encoded ? Buffer.from(event.body, "base64").toString("utf8") : event.body)
       : (event.body ? JSON.stringify(event.body) : "");
@@ -688,7 +735,7 @@ export const handler = async (event) => {
       try {
         for (const m of (twilioData.medias || [])) {
           if (!m.url) continue;
-          const buf = await downloadTwilioMedia(m.url);
+          const buf = await downloadMedia(m.url, false); // Try Twilio auth first, fallback to WhatsApp
           const mime = m.contentType || "image/jpeg";
           const ext = (mime.split("/")[1] || "jpg").split(";")[0];
           const mediaFile = await putMedia(buf, mime, userId, ext);
@@ -746,8 +793,8 @@ export const handler = async (event) => {
               
               try {
                 // Download and save the audio file to S3
-                console.log('[AUDIO] Downloading audio file from Twilio...');
-                const audioBuffer = await downloadTwilioMedia(media.url);
+                console.log('[AUDIO] Downloading audio file...');
+                const audioBuffer = await downloadMedia(media.url, false); // Try Twilio auth first, fallback to WhatsApp
                 console.log(`[AUDIO] Audio downloaded successfully, size: ${audioBuffer.length} bytes`);
                 
                 const audioExtension = media.contentType.split('/')[1] || 'ogg';
