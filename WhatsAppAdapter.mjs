@@ -1,6 +1,6 @@
 import querystring from 'querystring';
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { TranscribeClient, StartTranscriptionJobCommand, GetTranscriptionJobCommand } from "@aws-sdk/client-transcribe";
+import { TranscribeClient, StartTranscriptionJobCommand, GetTranscriptionJobCommand, DeleteTranscriptionJobCommand } from "@aws-sdk/client-transcribe";
 import crypto from "crypto";
 
 // ==========================================
@@ -360,16 +360,21 @@ const uploadToS3 = async (buffer, contentType, userId) => {
 };
 
 const startTranscription = async (audioUrl) => {
-  const jobName = `job-${crypto.randomUUID()}`;
+  // Validate S3 URL format
+  if (!audioUrl || !audioUrl.startsWith('s3://')) {
+    throw new Error(`Invalid S3 URL: ${audioUrl}`);
+  }
+  
+  const jobName = `transcribe-job-${crypto.randomUUID()}`;
   
   // Extract format from URL
   let mediaFormat = 'ogg'; // default
   if (audioUrl) {
     const urlParts = audioUrl.split('.');
-    const extension = urlParts[urlParts.length - 1];
+    const extension = urlParts[urlParts.length - 1]?.toLowerCase();
     if (['mp3', 'mpeg'].includes(extension)) {
       mediaFormat = 'mp3';
-    } else if (['mp4', 'm4a'].includes(extension)) {
+    } else if (['mp4', 'm4a', 'aac'].includes(extension)) {
       mediaFormat = 'mp4';
     } else if (['wav'].includes(extension)) {
       mediaFormat = 'wav';
@@ -377,6 +382,8 @@ const startTranscription = async (audioUrl) => {
       mediaFormat = 'webm';
     } else if (['ogg'].includes(extension)) {
       mediaFormat = 'ogg';
+    } else if (['flac'].includes(extension)) {
+      mediaFormat = 'flac';
     }
   }
   
@@ -384,18 +391,21 @@ const startTranscription = async (audioUrl) => {
   console.log(`[TRANSCRIBE] Audio URL: ${audioUrl}`);
   console.log(`[TRANSCRIBE] Media format: ${mediaFormat}`);
   
-  await transcribe.send(new StartTranscriptionJobCommand({
+  const transcriptionConfig = {
     TranscriptionJobName: jobName,
     LanguageCode: 'es-AR', // Español argentino
     MediaFormat: mediaFormat,
     Media: { MediaFileUri: audioUrl },
     Settings: {
       ShowSpeakerLabels: false,
-      MaxSpeakerLabels: 1,
       ShowAlternatives: false,
       MaxAlternatives: 1
     }
-  }));
+  };
+  
+  console.log(`[TRANSCRIBE] Transcription config:`, JSON.stringify(transcriptionConfig, null, 2));
+  
+  await transcribe.send(new StartTranscriptionJobCommand(transcriptionConfig));
   
   return jobName;
 };
@@ -419,9 +429,17 @@ const getTranscriptionResult = async (jobName) => {
       }
       
       if (status === 'COMPLETED') {
-        const transcriptUri = result.TranscriptionJob.Transcript.TranscriptFileUri;
+        const transcriptUri = result.TranscriptionJob.Transcript?.TranscriptFileUri;
         if (!transcriptUri) {
           console.error('[TRANSCRIBE] No transcript URI found in completed job');
+          // Clean up the job
+          try {
+            await transcribe.send(new DeleteTranscriptionJobCommand({
+              TranscriptionJobName: jobName
+            }));
+          } catch (cleanupError) {
+            console.warn('[TRANSCRIBE] Error cleaning up failed job:', cleanupError.message);
+          }
           return '';
         }
         
@@ -435,6 +453,17 @@ const getTranscriptionResult = async (jobName) => {
         
         const data = await response.json();
         const transcript = data.results?.transcripts?.[0]?.transcript || '';
+        
+        // Clean up the job after successful processing
+        try {
+          await transcribe.send(new DeleteTranscriptionJobCommand({
+            TranscriptionJobName: jobName
+          }));
+          console.log(`[TRANSCRIBE] Job cleaned up: ${jobName}`);
+        } catch (cleanupError) {
+          console.warn('[TRANSCRIBE] Error cleaning up successful job:', cleanupError.message);
+        }
+        
         console.log(`[TRANSCRIBE] ✅ Transcription completed: "${transcript}"`);
         return transcript;
       }
@@ -442,10 +471,30 @@ const getTranscriptionResult = async (jobName) => {
       if (status === 'FAILED') {
         const failureReason = result.TranscriptionJob?.FailureReason || 'Unknown reason';
         console.error(`[TRANSCRIBE] ❌ Transcription failed: ${failureReason}`);
+        console.error(`[TRANSCRIBE] Full job details:`, JSON.stringify(result.TranscriptionJob, null, 2));
+        
+        // Clean up the failed job
+        try {
+          await transcribe.send(new DeleteTranscriptionJobCommand({
+            TranscriptionJobName: jobName
+          }));
+        } catch (cleanupError) {
+          console.warn('[TRANSCRIBE] Error cleaning up failed job:', cleanupError.message);
+        }
+        
         throw new Error(`Transcription failed: ${failureReason}`);
       }
     } catch (error) {
       console.error(`[TRANSCRIBE] Error checking job status (attempt ${i + 1}):`, error);
+      console.error(`[TRANSCRIBE] Error name: ${error.name}`);
+      console.error(`[TRANSCRIBE] Error message: ${error.message}`);
+      
+      // If it's a permission error, fail immediately
+      if (error.name === 'AccessDenied' || error.name === 'UnauthorizedOperation') {
+        console.error('[TRANSCRIBE] Permission error, aborting transcription');
+        throw error;
+      }
+      
       // Continue trying unless it's the last attempt
       if (i === 29) {
         throw error;
@@ -454,12 +503,24 @@ const getTranscriptionResult = async (jobName) => {
   }
   
   console.error('[TRANSCRIBE] ❌ Transcription timeout after 30 attempts');
+  // Clean up the timed out job
+  try {
+    await transcribe.send(new DeleteTranscriptionJobCommand({
+      TranscriptionJobName: jobName
+    }));
+  } catch (cleanupError) {
+    console.warn('[TRANSCRIBE] Error cleaning up timed out job:', cleanupError.message);
+  }
+  
   throw new Error('Transcription timeout');
 };
 
 const transcribeAudio = async (media, userId) => {
+  let jobName = null;
+  
   try {
     console.log('[AUDIO] Processing audio...');
+    console.log('[AUDIO] Media object:', JSON.stringify(media, null, 2));
     
     let buffer;
     let contentType = media.contentType || 'audio/ogg';
@@ -472,7 +533,8 @@ const transcribeAudio = async (media, userId) => {
       });
       
       if (!meta.ok) {
-        throw new Error(`Failed to get WhatsApp media metadata: ${meta.status}`);
+        const errorText = await meta.text().catch(() => 'Unknown error');
+        throw new Error(`Failed to get WhatsApp media metadata: ${meta.status} ${meta.statusText} - ${errorText}`);
       }
       
       const metaData = await meta.json();
@@ -483,6 +545,7 @@ const transcribeAudio = async (media, userId) => {
       // Check if Twilio credentials are available
       const hasTwilioAuth = !!(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN);
       console.log(`[AUDIO] Processing direct URL with ${hasTwilioAuth ? 'Twilio' : 'WhatsApp'} auth`);
+      console.log(`[AUDIO] Media URL: ${media.url}`);
       buffer = await downloadMedia(media.url, !hasTwilioAuth); // Use WhatsApp auth if Twilio not available
     } else {
       throw new Error('No valid media URL or ID provided');
@@ -490,19 +553,47 @@ const transcribeAudio = async (media, userId) => {
     
     console.log(`[AUDIO] Buffer obtained, size: ${buffer.length} bytes`);
     
+    if (!buffer || buffer.length === 0) {
+      throw new Error('Downloaded audio buffer is empty');
+    }
+    
+    console.log(`[AUDIO] Uploading to S3 with content type: ${contentType}`);
     const s3Url = await uploadToS3(buffer, contentType, userId);
     console.log(`[AUDIO] Uploaded to S3: ${s3Url}`);
     
-    const jobName = await startTranscription(s3Url);
+    console.log('[AUDIO] Starting transcription job...');
+    jobName = await startTranscription(s3Url);
+    console.log(`[AUDIO] Transcription job started: ${jobName}`);
+    
+    console.log('[AUDIO] Waiting for transcription result...');
     const text = await getTranscriptionResult(jobName);
     
-    console.log('[AUDIO] Transcribed:', text);
-    return text;
+    if (text && text.trim()) {
+      console.log(`[AUDIO] ✅ Transcription successful: "${text}"`);
+      return text.trim();
+    } else {
+      console.warn('[AUDIO] ⚠️ Transcription completed but result is empty');
+      return null;
+    }
+    
   } catch (error) {
     console.error('[AUDIO] ❌ Error processing audio:', error);
     console.error('[AUDIO] Error type:', error.name);
     console.error('[AUDIO] Error message:', error.message);
     console.error('[AUDIO] Error stack:', error.stack);
+    
+    // Clean up any orphaned transcription job
+    if (jobName) {
+      try {
+        console.log(`[AUDIO] Cleaning up failed transcription job: ${jobName}`);
+        await transcribe.send(new DeleteTranscriptionJobCommand({
+          TranscriptionJobName: jobName
+        }));
+      } catch (cleanupError) {
+        console.warn('[AUDIO] Error cleaning up failed job:', cleanupError.message);
+      }
+    }
+    
     return null;
   }
 };
